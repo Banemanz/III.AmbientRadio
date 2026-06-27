@@ -59,6 +59,13 @@ std::string gGameFolder;
 std::string gScriptsFolder;
 std::ofstream gLog;
 bool gAmbientRadioEnabled = false;
+float gAmbientRadioDistance = 60.0f;
+float gAmbientRadioFullVolumeDistance = 8.0f;
+float gAmbientRadioVolume = 1.0f;
+float gAmbientRadioInCarVolume = 0.55f;
+bool gAmbientRadioParamEq = true;
+bool gAmbientRadioCompressor = true;
+bool gAmbientRadioReverb = false;
 
 static HSTREAM gStream = 0;
 bool gWasInVehicle = false;
@@ -765,6 +772,13 @@ static bool GenerateDefaultINI(const std::string& iniPath)
 
     out << "[SETTINGS]\n";
     out << "AmbientRadio=1\n";
+    out << "AmbientRadioDistance=60.0\n";
+    out << "AmbientRadioFullVolumeDistance=8.0\n";
+    out << "AmbientRadioVolume=1.0\n";
+    out << "AmbientRadioInCarVolume=0.55\n";
+    out << "AmbientRadioParamEq=1\n";
+    out << "AmbientRadioCompressor=1\n";
+    out << "AmbientRadioReverb=0\n";
     out << "RadioAutoTune=0\n";
     out << "RadioIconHud=0\n";
     out << "RadioIconScale=0.10\n";
@@ -944,6 +958,20 @@ static void LoadINI()
                 std::transform(key.begin(), key.end(), key.begin(), ::tolower);
                 if (key == "ambientradio")
                     gAmbientRadioEnabled = (val == "1");
+                else if (key == "ambientradiodistance")
+                    gAmbientRadioDistance = (float)atof(val.c_str());
+                else if (key == "ambientradiofullvolumedistance")
+                    gAmbientRadioFullVolumeDistance = (float)atof(val.c_str());
+                else if (key == "ambientradiovolume")
+                    gAmbientRadioVolume = (float)atof(val.c_str());
+                else if (key == "ambientradioincarvolume")
+                    gAmbientRadioInCarVolume = (float)atof(val.c_str());
+                else if (key == "ambientradioparameq")
+                    gAmbientRadioParamEq = (atoi(val.c_str()) != 0);
+                else if (key == "ambientradiocompressor")
+                    gAmbientRadioCompressor = (atoi(val.c_str()) != 0);
+                else if (key == "ambientradioreverb")
+                    gAmbientRadioReverb = (atoi(val.c_str()) != 0);
             }
             continue;
         }
@@ -997,6 +1025,24 @@ static void LoadINI()
             }
         }
     }
+
+    if (gAmbientRadioDistance < 5.0f) gAmbientRadioDistance = 5.0f;
+    if (gAmbientRadioDistance > 200.0f) gAmbientRadioDistance = 200.0f;
+    if (gAmbientRadioFullVolumeDistance < 1.0f) gAmbientRadioFullVolumeDistance = 1.0f;
+    if (gAmbientRadioFullVolumeDistance >= gAmbientRadioDistance)
+        gAmbientRadioFullVolumeDistance = gAmbientRadioDistance * 0.5f;
+    if (gAmbientRadioVolume < 0.0f) gAmbientRadioVolume = 0.0f;
+    if (gAmbientRadioVolume > 2.0f) gAmbientRadioVolume = 2.0f;
+    if (gAmbientRadioInCarVolume < 0.0f) gAmbientRadioInCarVolume = 0.0f;
+    if (gAmbientRadioInCarVolume > 1.0f) gAmbientRadioInCarVolume = 1.0f;
+
+    gLog << "AmbientRadio: distance=" << gAmbientRadioDistance
+        << ", fullVolumeDistance=" << gAmbientRadioFullVolumeDistance
+        << ", volume=" << gAmbientRadioVolume
+        << ", inCarVolume=" << gAmbientRadioInCarVolume
+        << ", effects(EQ/Comp/Reverb)=" << (gAmbientRadioParamEq ? 1 : 0)
+        << "/" << (gAmbientRadioCompressor ? 1 : 0)
+        << "/" << (gAmbientRadioReverb ? 1 : 0) << std::endl;
 
     gLog.flush();
 }

@@ -29,6 +29,13 @@ extern std::string gGameFolder;
 extern std::ofstream gLog;
 extern bool gBassReady;
 extern bool gPlayerInVehicle;
+extern float gAmbientRadioDistance;
+extern float gAmbientRadioFullVolumeDistance;
+extern float gAmbientRadioVolume;
+extern float gAmbientRadioInCarVolume;
+extern bool gAmbientRadioParamEq;
+extern bool gAmbientRadioCompressor;
+extern bool gAmbientRadioReverb;
 
 // Declared in RadioVehicles.cpp
 extern std::map<int, std::vector<int>> gVehicleStationMap;
@@ -64,9 +71,6 @@ static std::atomic<bool> gAmbientStreamReady(false);
 static std::atomic<bool> gAmbientLoadingInProgress(false);
 static int gAmbientLoadingStation = -1;
 
-// Distance thresholds
-static const float HEAR_DISTANCE = 60.0f;  // max range, volume = 0 here
-static const float MIN_START_DISTANCE = 8.0f;  // volume = max here
 
 static void StopAmbientStream()
 {
@@ -110,10 +114,16 @@ static const float AMBIENT_MAX_VOL = 1.0f;
 
 static float CalcVolume(float distance)
 {
-    if (distance >= HEAR_DISTANCE)      return 0.0f;
-    if (distance <= MIN_START_DISTANCE) return AMBIENT_MAX_VOL;
-    float range = HEAR_DISTANCE - MIN_START_DISTANCE;
-    float t = (HEAR_DISTANCE - distance) / range;
+    float hearDistance = gAmbientRadioDistance;
+    float fullVolumeDistance = gAmbientRadioFullVolumeDistance;
+    if (hearDistance < 5.0f) hearDistance = 5.0f;
+    if (fullVolumeDistance < 1.0f) fullVolumeDistance = 1.0f;
+    if (fullVolumeDistance >= hearDistance) fullVolumeDistance = hearDistance * 0.5f;
+
+    if (distance >= hearDistance)      return 0.0f;
+    if (distance <= fullVolumeDistance) return AMBIENT_MAX_VOL;
+    float range = hearDistance - fullVolumeDistance;
+    float t = (hearDistance - distance) / range;
     return t * t * AMBIENT_MAX_VOL;
 }
 
@@ -182,20 +192,44 @@ static void AmbientLoadThread(int stationIndex)
         BASS_ChannelSetPosition(stream, seekBytes, BASS_POS_BYTE);
     }
 
-    // Apply BASS' built-in DX8 parametric EQ to keep the exterior radio muffled
-    // without requiring the separate bass_fx add-on at link/deploy time.
-    BASS_DX8_PARAMEQ eq;
-    eq.fBandwidth = 18.0f;
+    // Optional built-in BASS DX8 effects for an exterior car/small-speaker sound.
+    // These stay in bass.dll (no bass_fx add-on) and can be toggled in the INI.
+    if (gAmbientRadioParamEq) {
+        BASS_DX8_PARAMEQ eq;
+        eq.fBandwidth = 18.0f;
 
-    HFX hFx = BASS_ChannelSetFX(stream, BASS_FX_DX8_PARAMEQ, 1);
-    eq.fCenter = 800.0f;
-    eq.fGain = -18.0f;
-    BASS_FXSetParameters(hFx, &eq);
+        HFX hFx = BASS_ChannelSetFX(stream, BASS_FX_DX8_PARAMEQ, 1);
+        eq.fCenter = 800.0f;
+        eq.fGain = -18.0f;
+        BASS_FXSetParameters(hFx, &eq);
 
-    HFX hFx2 = BASS_ChannelSetFX(stream, BASS_FX_DX8_PARAMEQ, 2);
-    eq.fCenter = 3500.0f;
-    eq.fGain = -28.0f;
-    BASS_FXSetParameters(hFx2, &eq);
+        HFX hFx2 = BASS_ChannelSetFX(stream, BASS_FX_DX8_PARAMEQ, 2);
+        eq.fCenter = 3500.0f;
+        eq.fGain = -28.0f;
+        BASS_FXSetParameters(hFx2, &eq);
+    }
+
+    if (gAmbientRadioCompressor) {
+        BASS_DX8_COMPRESSOR comp;
+        comp.fGain = 0.0f;
+        comp.fAttack = 8.0f;
+        comp.fRelease = 120.0f;
+        comp.fThreshold = -18.0f;
+        comp.fRatio = 3.0f;
+        comp.fPredelay = 4.0f;
+        HFX hComp = BASS_ChannelSetFX(stream, BASS_FX_DX8_COMPRESSOR, 3);
+        BASS_FXSetParameters(hComp, &comp);
+    }
+
+    if (gAmbientRadioReverb) {
+        BASS_DX8_REVERB rev;
+        rev.fInGain = 0.0f;
+        rev.fReverbMix = -18.0f;
+        rev.fReverbTime = 450.0f;
+        rev.fHighFreqRTRatio = 0.25f;
+        HFX hRev = BASS_ChannelSetFX(stream, BASS_FX_DX8_REVERB, 4);
+        BASS_FXSetParameters(hRev, &rev);
+    }
 
     // Hand the ready stream to the main thread
     {
@@ -262,7 +296,7 @@ public:
 
                     CVehicle* newVehicle = nullptr;
                     int newStation = -1;
-                    float newDistSq = HEAR_DISTANCE * HEAR_DISTANCE;
+                    float newDistSq = gAmbientRadioDistance * gAmbientRadioDistance;
 
                     for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
                         if (CPools::ms_pVehiclePool->IsFreeSlotAtIndex(i)) continue;
@@ -320,9 +354,9 @@ public:
                 }
 
                 float distance = sqrtf(closestDistSq);
-                float volume = CalcVolume(distance);
+                float volume = CalcVolume(distance) * gAmbientRadioVolume;
                 if (gPlayerInVehicle)
-                    volume *= 0.55f; // heard through the player's car shell: present, but not as loud as on foot
+                    volume *= gAmbientRadioInCarVolume; // heard through the player's car shell
                 float gameVol = RadioVolume(GetMusicVolume());
 
                 // Stream fully prepared in background — just play it
@@ -346,7 +380,7 @@ public:
                 // Stream playing — update volume or reload if vehicle changed
                 if (gAmbientStream) {
                     if (closestVehicle != gAmbientVehicle || closestStation != gAmbientStation) {
-                        if (distance < HEAR_DISTANCE && !gAmbientLoadingInProgress)
+                        if (distance < gAmbientRadioDistance && !gAmbientLoadingInProgress)
                             StartAmbientLoad(closestStation, closestVehicle);
                     }
                     else {
@@ -366,7 +400,7 @@ public:
                 // Nothing playing, nothing loading — start anywhere inside audible range.
                 // The previous VC threshold only started in a narrow far-away band,
                 // so nearby NPC cars never began ambient playback.
-                if (!gAmbientLoadingInProgress && distance < HEAR_DISTANCE)
+                if (!gAmbientLoadingInProgress && distance < gAmbientRadioDistance)
                     StartAmbientLoad(closestStation, closestVehicle);
             });
     }
