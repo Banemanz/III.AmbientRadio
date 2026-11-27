@@ -1191,6 +1191,12 @@ public:
                     sLastPed = pPlayer;
                 }
 
+                // Never leave the previous frame's seated flag active during a
+                // pause menu, failed entry, or an instantaneous bike exit.
+                CVehicle* pVehicle = pPlayer->m_pVehicle;
+                bool inVehicle = pPlayer->m_bInVehicle && pVehicle != nullptr;
+                gPlayerInVehicle = inVehicle;
+
                 // Pause the new radio while the pause menu is open (avoids clashing
                 // with VC's own radio preview in the audio-settings screen) OR while
                 // a cutscene / scripted scene is playing — otherwise the radio keeps
@@ -1213,21 +1219,50 @@ public:
                 }
                 if (isPaused) return;
 
-                CVehicle* pVehicle = pPlayer->m_pVehicle;
-                bool inVehicle = pPlayer->m_bInVehicle;
-                gPlayerInVehicle = inVehicle;
-
                 // Remember the current vehicle so we can save its station on exit
                 // (m_pVehicle is null on the exit frame, and the instant you're
                 // knocked off a bike).
                 if (inVehicle && pVehicle)
                     gActiveVehicle = pVehicle;
 
+                // Process exit BEFORE any BASS loading, switch debounce or announcement
+                // handling. Previously the exit ran after PlayLoadedStation and could
+                // briefly start radio playback while Claude was already on foot.
+                if (!inVehicle) {
+                    const bool hadPlayerRadio = gWasInVehicle || gStream ||
+                        gWaitingToPlay || gPendingStation != -1;
+                    if (gWasInVehicle)
+                        OnPlayerExitVehicle(gActiveVehicle);
+                    if (hadPlayerRadio) {
+                        StopRadio();
+                        StopStaticSound();
+                        CancelPendingStationLoad();
+                    }
+                    gActiveVehicle = nullptr;
+                    gWasInVehicle = false;
+                    gNoRadioVehicle = false;
+                    gPoliceRadioPlaying = false;
+                    gCurrentStation = -1;
+                    gPendingStation = -1;
+                    gLastSwitchTick = 0;
+                    gLastNativeStation = -1;
+                    gWaitingToPlay = false;
+                    gForcedSeekStation = -1;
+                    gAnnouncementPlaying = false;
+                    gStationNameToShow.clear();
+                    gSwitchNext = gSwitchPrev = gRadioOff = false;
+                    // Do not consume queued native bridge announcements here:
+                    // they can be issued by SCM while Claude is on foot.
+                    UpdateVolume();
+                    return;
+                }
+
                 // ===== No-radio vehicles ([NORADIO] section): total silence =====
                 // Checked before everything else so it overrides music, police
                 // radio and announcements alike.
                 if (inVehicle && pVehicle && IsNoRadioVehicle(pVehicle->m_nModelIndex)) {
                     if (!gNoRadioVehicle) {
+                        CancelPendingStationLoad();
                         StopRadio();
                         StopStaticSound();
                         gNoRadioVehicle = true;
@@ -1296,7 +1331,7 @@ public:
                                 std::lock_guard<std::mutex> lock(gLoadMutex);
                                 gLoadedBuffer.clear();
                             }
-                            gBufferReady = false;
+                            CancelPendingStationLoad();
                             gPendingStation = -1;
                             gLastSwitchTick = 0;
                             gCurrentStation = nativeStation;
@@ -1324,7 +1359,7 @@ public:
                         std::lock_guard<std::mutex> lock(gLoadMutex);
                         gLoadedBuffer.clear();
                     }
-                    gBufferReady = false;
+                    CancelPendingStationLoad();
                     gCurrentStation = station;
                     StartLoadingStation(station);
                 }
@@ -1380,7 +1415,9 @@ public:
                 else if (gQueuedAnnouncement != -1 && gWasInVehicle && inVehicle) {
                     int ann = gQueuedAnnouncement;
                     gQueuedAnnouncement = -1;
-                    std::string annFile = gGameFolder + "audio\\" + (ann == 0 ? "BCLOSED.mp3" : "BOPEN.mp3");
+                    // GTA III's two bridge tracks are COMOPEN and SUBOPEN,
+                    // not Vice City's BOPEN/BCLOSED naming convention.
+                    std::string annFile = gGameFolder + "audio\\" + (ann == 0 ? "COMOPEN.MP3" : "SUBOPEN.MP3");
 
                     StopRadio();
                     StopStaticSound();
@@ -1503,7 +1540,8 @@ public:
                             next = base + (goNext ? 1 : -1);
                         }
 
-                        PlayTuningSound();
+                        if (gRadioSwitchSfx)
+                            PlayTuningSound();
 
                         if (next < 0 || next >= (int)stations.size()) {
                             gPendingStation = -1;
@@ -1512,7 +1550,7 @@ public:
                             TurnRadioOff();
                         }
                         else {
-                            if (!gSfxStaticStream)
+                            if (gRadioSwitchSfx && !gSfxStaticStream)
                                 StartStaticSound();
 
                             StopRadio();
@@ -1544,23 +1582,6 @@ public:
                     }
                 }
 
-                if (!inVehicle && gWasInVehicle) {
-                    OnPlayerExitVehicle(gActiveVehicle ? gActiveVehicle : pVehicle);
-                    gActiveVehicle = nullptr;
-                    StopRadio();
-                    StopStaticSound();
-                    gStationNameToShow = "";
-                    gWasInVehicle = false;
-                    gNoRadioVehicle = false;
-                    gCurrentStation = -1;
-                    gPendingStation = -1;
-                    gLastSwitchTick = 0;
-                    gWaitingToPlay = false;
-                    gPendingScmStation.exchange(-1);
-                    gPendingScmStationTime.exchange(-1);
-                    gForcedSeekStation = -1;
-                }
-
                 // ===== Audio ducking: dim the radio under mission dialogue (opcode
                 // 03D1, refreshed per line) and the mission-passed tune (opcode 0394),
                 // like the original game. Both deadlines are set by the SCM hook. =====
@@ -1586,7 +1607,7 @@ public:
                 if (gPlayerInVehicle && gActiveVehicle)
                     ForceNativeRadioOff(gActiveVehicle);
 
-                if (gStationNameToShow.empty()) return;
+                if (!gPlayerInVehicle || gStationNameToShow.empty()) return;
                 if (GetTickCount() - gStationNameTimer > STATION_NAME_DURATION) {
                     gStationNameToShow = "";
                     return;
