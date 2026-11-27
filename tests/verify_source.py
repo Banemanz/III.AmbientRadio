@@ -22,6 +22,9 @@ require("gActiveStreamBuffer = std::move(gLoadedBuffer)" in main,
         "Player audio must own memory separately from the worker staging buffer")
 require(main.index("BASS_StreamFree(gStream);") < main.index("gActiveStreamBuffer.clear();"),
         "Player stream must be freed before the backing memory")
+require("std::call_once(gMp3DurationsOnce" in main and
+        "gMp3DurationsMs[i]" in main,
+        "MP3 selection must use cached metadata, not reopen every track")
 require("gLoadGeneration.fetch_add" in main and
         "gLoadGeneration.load(std::memory_order_acquire)" in main,
         "Player radio needs stale-worker cancellation")

@@ -541,42 +541,38 @@ static std::vector<std::string> ScanMp3Folder(const std::string& folder)
     return files;
 }
 
+// BASS stream headers are opened exactly once per MP3 file (on the first
+// MP3-player selection). Subsequent song changes use cached durations.
+static std::once_flag gMp3DurationsOnce;
+static std::vector<double> gMp3DurationsMs;
+
 static void EnsureMp3Durations()
 {
-    static bool loaded = false;
-    if (loaded) return;
-
-    double total = 0.0;
-    for (const auto& f : gMp3Files) {
-        HSTREAM s = BASS_StreamCreateFile(FALSE, f.c_str(), 0, 0, 0);
-        if (s) {
-            QWORD bytes = BASS_ChannelGetLength(s, BASS_POS_BYTE);
-            double d = BASS_ChannelBytes2Seconds(s, bytes) * 1000.0;
-            total += d > 0 ? d : 1.0;
-            BASS_StreamFree(s);
+    std::call_once(gMp3DurationsOnce, []() {
+        double total = 0.0;
+        gMp3DurationsMs.reserve(gMp3Files.size());
+        for (const auto& file : gMp3Files) {
+            double duration = 1.0;
+            HSTREAM metadata = BASS_StreamCreateFile(FALSE, file.c_str(), 0, 0, 0);
+            if (metadata) {
+                QWORD bytes = BASS_ChannelGetLength(metadata, BASS_POS_BYTE);
+                double seconds = BASS_ChannelBytes2Seconds(metadata, bytes);
+                if (seconds > 0.0) duration = seconds * 1000.0;
+                BASS_StreamFree(metadata);
+            }
+            gMp3DurationsMs.push_back(duration);
+            total += duration;
         }
-        else {
-            total += 1.0;
-        }
-    }
-
-    loaded = true;
-
-    {
         std::lock_guard<std::mutex> lock(gMp3Mutex);
         gMp3TotalDuration = total;
         if (total > 0.0)
             gMp3RandomOffset = fmod((double)(rand() % 1000000), total);
-    }
-
-    gLog << "MP3 durations loaded, total: " << (DWORD)(total / 1000.0) << "s" << std::endl;
-    gLog.flush();
+    });
 }
 
 static void GetMp3PlayerPosition(double radioTime, int& fileIndex, double& seekMs)
 {
     if (gMp3Files.empty()) { fileIndex = 0; seekMs = 0; return; }
-
     EnsureMp3Durations();
 
     double total, offset;
@@ -585,26 +581,17 @@ static void GetMp3PlayerPosition(double radioTime, int& fileIndex, double& seekM
         total = gMp3TotalDuration;
         offset = gMp3RandomOffset;
     }
-
     if (total <= 0.0) { fileIndex = 0; seekMs = 0; return; }
-
     double pos = fmod(radioTime + offset, total);
-
-    for (int i = 0; i < (int)gMp3Files.size(); i++) {
-        HSTREAM s = BASS_StreamCreateFile(FALSE, gMp3Files[i].c_str(), 0, 0, 0);
-        double dur = 1.0;
-        if (s) {
-            QWORD bytes = BASS_ChannelGetLength(s, BASS_POS_BYTE);
-            double d = BASS_ChannelBytes2Seconds(s, bytes) * 1000.0;
-            if (d > 0) dur = d;
-            BASS_StreamFree(s);
-        }
-        if (pos < dur) {
-            fileIndex = i;
+    if (pos < 0.0) pos += total;
+    for (size_t i = 0; i < gMp3DurationsMs.size(); ++i) {
+        const double duration = gMp3DurationsMs[i];
+        if (pos < duration) {
+            fileIndex = static_cast<int>(i);
             seekMs = pos;
             return;
         }
-        pos -= dur;
+        pos -= duration;
     }
     fileIndex = 0;
     seekMs = 0;
@@ -620,15 +607,14 @@ static void LoadStationThread(int index, unsigned int generation, double timelin
         double seekMs;
         GetMp3PlayerPosition(timelineSnapshot, fileIndex, seekMs);
 
-        if (gLoadGeneration.load(std::memory_order_acquire) != generation) return;
-        {
-            std::lock_guard<std::mutex> lock(gMp3Mutex);
-            gMp3FilePath = gMp3Files[fileIndex];
-            gMp3SeekMs = seekMs;
-        }
         {
             std::lock_guard<std::mutex> lock(gLoadMutex);
             if (gLoadGeneration.load(std::memory_order_acquire) != generation) return;
+            {
+                std::lock_guard<std::mutex> mp3Lock(gMp3Mutex);
+                gMp3FilePath = gMp3Files[fileIndex];
+                gMp3SeekMs = seekMs;
+            }
             gLoadedBuffer.clear();
             gBufferReady.store(true, std::memory_order_release);
             gLoadingInProgress.store(false, std::memory_order_release);
