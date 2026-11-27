@@ -11,6 +11,8 @@ root = Path(__file__).resolve().parents[1]
 main = (root / "source/Main.cpp").read_text(encoding="utf-8")
 ambient = (root / "source/AmbientCar.cpp").read_text(encoding="utf-8")
 switch = (root / "source/Switch.cpp").read_text(encoding="utf-8")
+vehicles = (root / "source/RadioVehicles.cpp").read_text(encoding="utf-8")
+policy = (root / "source/RadioPolicy.h").read_text(encoding="utf-8")
 project = (root / "IIIAmbientRadioEXP.vcxproj").read_text(encoding="utf-8")
 workflow = (root / ".github/workflows/build.yml").read_text(encoding="utf-8")
 
@@ -38,9 +40,9 @@ require("CREATE_NEW" in main and "std::ios::trunc" not in main,
         "INI must be created once, never truncate an existing file")
 require("gRadioSwitchSfx = false" in main,
         "Legacy mismatched switch sounds must be opt-in")
-require("if (!gPlayerInVehicle || gStationNameToShow.empty()) return;" in main,
+require("if (!gPlayerInVehicle || !player || !player->m_bInVehicle" in main,
         "Radio banner should not appear on foot")
-require("if (!inVehicle) {" in main and
+require("if (!inVehicle || vehicleRef != gActiveVehicleRef)" in main and
         main.index("// Process exit BEFORE") < main.index("if (gWasInVehicle && gWaitingToPlay"),
         "Exit must run before queued playback")
 require("plugin::CallMethod<0x5680E0" not in main,
@@ -74,6 +76,32 @@ require("624a6a49265fd7a6fc63bda1611013ceabeacb8a" in workflow and
         "windows-2022" in workflow,
         "CI must use the pinned Oct 25, 2025 Plugin-SDK on Windows")
 
+require("gAmbientRadioDistance = 20.0f" in main and "AmbientRadioDistance=20.0" in main,
+        "The runtime and new INI use the 20-unit default")
+require('gStationNameToShow = "RADIO OFF";' in main,
+        "Radio OFF HUD must be uppercase")
+require("NativePolice = 10" in policy and "NativeOff = 11" in policy and
+        "vehicle->m_nRadioStation = RadioPolicy::NativeOff" in main and
+        "m_nRadioStation = 10" not in main and "m_nRadioInCar = 10" not in main,
+        "Native OFF must never select POLICE.WAV")
+require("gMusicManager.m_bSetNextStation = true" in main and
+        "m_nCurrentStreamedSound =" not in main and "gMusicManager.m_bDoTrackService =" not in main,
+        "Request native transition instead of clobbering active stream or mission service")
+require(all(address in switch for address in ("0x57D7D8", "0x57D899", "0x57DC3A", "0x57D7EC")) and
+        "std::memcmp" in switch and "return RadioPolicy::NativeOff" in switch,
+        "Verified tuning callsites and F9 bypass must avoid stock playback")
+require("GetAmbientStationForVehicle" in ambient and "GetStationForVehicle(pVehicle, &inheritedNpc)" in main
+        and "SaveAssignment(vehicle, station, true)" in vehicles and "CPools::GetVehicle(handle)" in vehicles
+        and "gAmbientVehicle == pVehicle" not in vehicles,
+        "NPC assignment is persistent across audibility/entry, independent of event ordering")
+require("LoadDecryptedAdf" in main and "LoadDecryptedAdf" in ambient,
+        "Both workers use cancellable, bounded-chunk ADF reads")
+require("gAmbientVehicleRef != sCachedVehicleRef" in ambient and
+        "ResolveAmbientVehicle(gAmbientVehicleRef, ownVehicle)" in ambient,
+        "Never publish obsolete ambient source or play exterior audio from entered car")
+require("RadioPolicy::MapScriptStation" in main and "loadOne(188, gWavStatic)" in main and
+        "loadOne(344 + i" not in main,
+        "No VC-index or unrelated-SDT audio in station selection")
 binary = root / "bin/GTA3/Release/III.AmbientRadio.asi"
 if binary.exists():
     data = binary.read_bytes()

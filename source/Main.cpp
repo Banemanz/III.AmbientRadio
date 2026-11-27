@@ -2,6 +2,9 @@
 #include "CPad.h"
 #include "CPlayerPed.h"
 #include "CVehicle.h"
+#include "CPools.h"
+#include "RadioPolicy.h"
+#include "RadioFileLoader.h"
 #include "cDMAudio.h"
 #include "cMusicManager.h"
 #include "cSampleManager.h"
@@ -38,7 +41,7 @@ extern bool gRadioOff;   // set by Switch.cpp when the switch button is held ~2.
 bool DrawRadioStationIcon(const std::string& stationName, float resW, float resH, unsigned char alpha);
 
 // Declared in RadioVehicles.cpp
-int GetStationForVehicle(CVehicle* pVehicle);
+int GetStationForVehicle(CVehicle* pVehicle, bool* inheritedNpc);
 void OnPlayerExitVehicle(CVehicle* pVehicle);
 bool IsNoRadioVehicle(int modelId);
 
@@ -80,7 +83,7 @@ static void FlushRadioWorkerLogs()
     }
 }
 bool gAmbientRadioEnabled = false;
-float gAmbientRadioDistance = 60.0f;
+float gAmbientRadioDistance = 20.0f;
 float gAmbientRadioFullVolumeDistance = 8.0f;
 float gAmbientRadioVolume = 1.0f;
 float gAmbientRadioInCarVolume = 0.55f;
@@ -100,7 +103,7 @@ bool gPlayerInVehicle = false;
 // instance — m_pVehicle is already null on the exit frame (instantly so when
 // knocked off a bike), so without this the station would be saved to a null key
 // and the vehicle would forget it after the 5s timer expired.
-static CVehicle* gActiveVehicle = nullptr;
+static int gActiveVehicleRef = -1;
 bool gBassReady = false;
 static bool gWasPaused = false;
 static unsigned char gLastVolume = 0;
@@ -198,13 +201,13 @@ static double ParseTimecodeMs(const std::string& s)
 // main thread.
 double StationTimelineMs(int index, bool applyStartOffset)
 {
-    // Indices 0..8 are the nine original Vice City stations (the INI lists them
-    // in VC's canonical order). Index 9 and up are added/custom stations.
+    // Indices 0..8 are the nine original GTA III stations (the INI lists them
+    // in III's canonical order). Index 9 and up are added/custom stations.
     double base = (index >= 0 && index < 9 && gOriginalsFromTop)
         ? (gRadioTime - gRadioStartOffset) // originals on a NEW GAME: clock starts at 0 (top of broadcast)
         : gRadioTime;                       // added stations, and ALL stations after a save load: randomized "already playing" offset
 
-    if (applyStartOffset && gStartOffsetsActive) {
+    if (gStartOffsetsActive) {
         auto off = gStationStartOffsetMs.find(index);
         if (off != gStationStartOffsetMs.end()) {
             // Anchor on the station's FIRST play this session: it opens exactly at
@@ -212,9 +215,9 @@ double StationTimelineMs(int index, bool applyStartOffset)
             // ran), then drifts forward naturally — so an announcement or a re-tune
             // resumes where it was instead of snapping back to the offset.
             auto anc = gStationAnchorDelta.find(index);
-            if (anc == gStationAnchorDelta.end())
+            if (anc == gStationAnchorDelta.end() && applyStartOffset)
                 anc = gStationAnchorDelta.emplace(index, off->second - base).first;
-            base += anc->second;
+            if (anc != gStationAnchorDelta.end()) base += anc->second;
         }
     }
     return base;
@@ -238,8 +241,8 @@ static int gLoadingStation = -1;
 
 // Station display + debounce
 static bool gWaitingToPlay = false;
-static int gLastNativeStation = -1;
 static bool gPoliceRadioPlaying = false;
+static bool gPoliceOverrideActive = false;
 int gPendingStation = -1;
 static DWORD gLastSwitchTick = 0;
 static const DWORD SWITCH_DEBOUNCE_MS = 500;
@@ -247,8 +250,8 @@ static std::string gStationNameToShow = "";
 static DWORD gStationNameTimer = 0;
 static const DWORD STATION_NAME_DURATION = 3000;
 
-// Radio announcements (SCM opcode 057D). gPendingAnnouncement is set by the
-// hook in Switch.cpp (0 = bclosed, 1 = bopen, -1 = none). gQueuedAnnouncement
+// Native III bridge announcements. gPendingAnnouncement is set by the
+// hook in Switch.cpp (0 = COMOPEN, 1 = SUBOPEN, -1 = none). gQueuedAnnouncement
 // holds a request until the player is actually in a vehicle (matching the
 // game's native behaviour of waiting until you're driving).
 extern std::atomic<int> gPendingAnnouncement;
@@ -268,10 +271,9 @@ static HSTREAM gSfxTuningStream = 0;
 static HSTREAM gSfxStaticStream = 0;
 static bool gSfxLoaded = false;
 static bool gSfxLoadAttempted = false;
-static bool gInitialStationQueued = false;
-static bool gRadioSwitchSfx = false; // legacy GTA:VC bank offsets are not GTA III sample IDs
+static bool gRadioSwitchSfx = false; // optional native III click/crackle samples
 
-// SDT entry structure — GTA VC PC: 20 bytes each
+// GTA III PC SDT entry: 20 bytes (offset,size,frequency,loop fields).
 struct SdtEntry {
     DWORD offset;
     DWORD size;
@@ -280,10 +282,9 @@ struct SdtEntry {
     DWORD loopEnd;
 };
 
-// 343 = tuning click, 344-355 = static sounds
-static int gStaticSoundIndex = 0;
+// III sample bank: 343 = RADIO_CLICK, 188 = POLICE_RADIO_CRACKLE (noise only).
 static std::vector<BYTE> gWavTuning;
-static std::vector<BYTE> gWavStatic[12];
+static std::vector<BYTE> gWavStatic;
 
 static bool FileExists(const std::string& path)
 {
@@ -365,24 +366,26 @@ static void LoadAllSfx()
     gLog << "SFX: loading from " << baseFolder << "audio\\" << std::endl;
 
     auto loadOne = [&](int index, std::vector<BYTE>& wavOut) -> bool {
-        SdtEntry entry;
+        SdtEntry entry{};
+        sdt.clear();
         sdt.seekg(index * sizeof(SdtEntry));
-        sdt.read((char*)&entry, sizeof(SdtEntry));
-        if (entry.size == 0) {
+        if (!sdt.read((char*)&entry, sizeof(SdtEntry))) return false;
+        if (entry.size == 0 || entry.size > 4u * 1024u * 1024u ||
+            entry.sampleRate < 4000 || entry.sampleRate > 192000 || (entry.size & 1)) {
             gLog << "SFX: entry " << index << " has zero size" << std::endl;
             return false;
         }
         std::vector<BYTE> pcm(entry.size);
+        raw.clear();
         raw.seekg(entry.offset);
-        raw.read((char*)pcm.data(), entry.size);
+        if (!raw.read((char*)pcm.data(), entry.size)) return false;
         BuildWav(pcm, entry.sampleRate, wavOut);
         gLog << "SFX: sound " << index << " loaded — " << entry.size << " bytes @ " << entry.sampleRate << " Hz" << std::endl;
         return true;
         };
 
     bool ok = loadOne(343, gWavTuning);
-    for (int i = 0; i < 12; i++)
-        loadOne(344 + i, gWavStatic[i]);
+    loadOne(188, gWavStatic); // III crackle only, never voice or engine samples
 
     sdt.close();
     raw.close();
@@ -419,11 +422,9 @@ static void StartStaticSound()
         gSfxStaticStream = 0;
     }
 
-    int pick = gStaticSoundIndex % 12;
-    gStaticSoundIndex = (gStaticSoundIndex + 1) % 12;
-    if (gWavStatic[pick].empty()) return;
+    if (gWavStatic.empty()) return;
 
-    gSfxStaticStream = CreateRawStream(gWavStatic[pick], true);
+    gSfxStaticStream = CreateRawStream(gWavStatic, true);
     if (gSfxStaticStream) {
         BASS_ChannelSetAttribute(gSfxStaticStream, BASS_ATTRIB_VOL, RadioVolume(GetMusicVolume()));
         BASS_ChannelPlay(gSfxStaticStream, FALSE);
@@ -436,6 +437,11 @@ static void StopStaticSound()
         BASS_ChannelStop(gSfxStaticStream);
         BASS_StreamFree(gSfxStaticStream);
         gSfxStaticStream = 0;
+    }
+    if (gSfxTuningStream) {
+        BASS_ChannelStop(gSfxTuningStream);
+        BASS_StreamFree(gSfxTuningStream);
+        gSfxTuningStream = 0;
     }
 }
 
@@ -465,8 +471,9 @@ static void TurnRadioOff()
     StopStaticSound();
     CancelPendingStationLoad();
     gCurrentStation = -1;
+    gForcedSeekStation = -1;
     gWaitingToPlay = false;
-    gStationNameToShow = "Radio Off";
+    gStationNameToShow = "RADIO OFF";
     gStationNameTimer = GetTickCount();
     gLog << "Radio off" << std::endl;
     gLog.flush();
@@ -494,33 +501,53 @@ static void StopAndResetRadio()
     CancelPendingStationLoad();
     gWasInVehicle = false;
     gPlayerInVehicle = false;
-    gActiveVehicle = nullptr;
+    gActiveVehicleRef = -1;
     gCurrentStation = -1;
     gPendingStation = -1;
-    gInitialStationQueued = false;
     gLastSwitchTick = 0;
     gAnnouncementPlaying = false;
     gQueuedAnnouncement = -1;
+    gPendingAnnouncement.exchange(-1);
     gPoliceRadioPlaying = false;
+    gPoliceOverrideActive = false;
     gNoRadioVehicle = false;
     gForcedSeekStation = -1;
+    gSwitchNext = gSwitchPrev = gRadioOff = false;
+    gDuckFactor = gLastDuckApplied = 1.0f;
     gPendingScmStation.exchange(-1);
     gPendingScmStationTime.exchange(-1);
     gStationNameToShow = "";
 }
 
-static void ForceNativeRadioOff(CVehicle* pVehicle)
+// Native police vehicles use the engine's exact UsesPoliceRadio predicate.
+// Keep native dispatch in genuine police vehicles unless the optional custom
+// police.mp3 successfully plays. All civilian and [NORADIO] cars use native OFF.
+bool ShouldSuppressNativeVehicleRadio(CVehicle* vehicle)
 {
-    bRadioOff = true;
-    gMusicManager.m_nRadioInCar = 10;
-    gMusicManager.m_nRadioStation = 10;
-    gMusicManager.m_bRadioSetByScript = false;
+    if (!vehicle) return false;
+    const bool customPolice = gPoliceOverrideActive && gActiveVehicleRef >= 0 && CPools::ms_pVehiclePool &&
+        CPools::GetVehicle(gActiveVehicleRef) == vehicle;
+    return RadioPolicy::SuppressNativeTuning(IsNoRadioVehicle(vehicle->m_nModelIndex),
+        gMusicManager.UsesPoliceRadio(vehicle), customPolice);
+}
 
-    // NEVER StopStreamedFile(0) here. GTA III shares that channel with mission
-    // passed music, bridge announcements, scripted cutscenes and ambience.
-    // Repeatedly stopping it caused those native sounds to fail in vehicles.
-    if (pVehicle)
-        pVehicle->m_nRadioStation = 10;
+static void ForceNativeRadioOff(CVehicle* vehicle)
+{
+    if (!ShouldSuppressNativeVehicleRadio(vehicle)) return;
+    vehicle->m_nRadioStation = RadioPolicy::NativeOff;
+    // The stream manager's active track fields are deliberately NOT overwritten.
+    // The native game service must finish/transition tracks normally; 11 is
+    // OFF/city ambience, whereas 10 is POLICE.WAV, the underlying bug.
+    if (gMusicManager.m_nMusicMode != RadioPolicy::NativeGameMode) return;
+    gMusicManager.m_nRadioInCar = RadioPolicy::NativeOff;
+    gMusicManager.m_nRadioStation = RadioPolicy::NativeOff;
+    gMusicManager.m_bRadioSetByScript = false;
+    if (RadioPolicy::NativeRadioTrack(gMusicManager.m_nCurrentStreamedSound) &&
+        !gMusicManager.m_bAnnouncementInProgress) {
+        gNumRetunePresses = 0;
+        gRetuneCounter = 0;
+        gMusicManager.m_bSetNextStation = true;
+    }
 }
 
 static bool IsADF(const std::string& path)
@@ -653,31 +680,18 @@ static void LoadStationThread(int index, unsigned int generation, double timelin
 
     if (IsADF(fullPath))
     {
-        std::ifstream f(fullPath, std::ios::binary);
-        if (!f.is_open()) {
-            QueueRadioWorkerLog("Thread: cannot open " + fullPath);
-            {
-                std::lock_guard<std::mutex> lock(gLoadMutex);
-                if (gLoadGeneration.load(std::memory_order_acquire) == generation) {
-                    gLoadingInProgress.store(false, std::memory_order_release);
-                    gBufferReady.store(true, std::memory_order_release); // playback reports missing ADF
-                }
+        const auto cancelled = [generation]() {
+            return gLoadGeneration.load(std::memory_order_acquire) != generation;
+        };
+        if (!LoadDecryptedAdf(fullPath, buf, cancelled)) {
+            if (cancelled()) return;
+            QueueRadioWorkerLog("Thread: could not read/decrypt " + fullPath);
+            std::lock_guard<std::mutex> lock(gLoadMutex);
+            if (!cancelled()) {
+                gLoadingInProgress.store(false, std::memory_order_release);
+                gBufferReady.store(true, std::memory_order_release);
             }
             return;
-        }
-
-        buf = std::vector<BYTE>(
-            std::istreambuf_iterator<char>(f),
-            std::istreambuf_iterator<char>()
-        );
-
-        for (size_t pos = 0; pos < buf.size(); ++pos) {
-            // Cancellation during a large ADF decrypt: don't waste CPU on a
-            // station superseded by repeated radio-wheel inputs.
-            if ((pos & 0xFFFFF) == 0 &&
-                gLoadGeneration.load(std::memory_order_acquire) != generation)
-                return;
-            buf[pos] ^= 0x22;
         }
     }
 
@@ -724,7 +738,7 @@ static void PlayLoadedStation(int index)
             filePath = gMp3FilePath;
             seekMs = gMp3SeekMs;
         }
-        gStream = BASS_StreamCreateFile(FALSE, filePath.c_str(), 0, 0, BASS_SAMPLE_LOOP);
+        gStream = BASS_StreamCreateFile(FALSE, filePath.c_str(), 0, 0, 0); // advance playlist at EOF
         if (!gStream) {
             gLog << "BASS MP3 error: " << BASS_ErrorGetCode() << std::endl;
             gLog.flush();
@@ -754,6 +768,7 @@ static void PlayLoadedStation(int index)
         }
         else {
             std::string fullPath = gGameFolder + stations[index].file;
+            if (IsADF(fullPath)) { gLog << "ADF unavailable: " << fullPath << std::endl; return; }
             gStream = BASS_StreamCreateFile(FALSE, fullPath.c_str(), 0, 0, BASS_SAMPLE_LOOP);
             if (!gStream) {
                 gLog << "BASS error: " << BASS_ErrorGetCode() << std::endl;
@@ -782,7 +797,7 @@ static void PlayLoadedStation(int index)
 
     unsigned char vol = GetMusicVolume();
     gLastVolume = vol;
-    BASS_ChannelSetAttribute(gStream, BASS_ATTRIB_VOL, RadioVolume(vol));
+    BASS_ChannelSetAttribute(gStream, BASS_ATTRIB_VOL, RadioVolume(vol) * gDuckFactor);
     BASS_ChannelPlay(gStream, FALSE);
     gCurrentStation = index;
     if (index >= 0 && index < (int)stations.size()) {
@@ -806,7 +821,7 @@ static bool GenerateDefaultINI(const std::string& iniPath)
 
     out << "[SETTINGS]\n";
     out << "AmbientRadio=1\n";
-    out << "AmbientRadioDistance=60.0\n";
+    out << "AmbientRadioDistance=20.0\n";
     out << "AmbientRadioFullVolumeDistance=8.0\n";
     out << "AmbientRadioVolume=1.0\n";
     out << "AmbientRadioInCarVolume=0.55\n";
@@ -1069,6 +1084,10 @@ static void LoadINI()
         }
     }
 
+    if (!std::isfinite(gAmbientRadioDistance)) gAmbientRadioDistance = 20.0f;
+    if (!std::isfinite(gAmbientRadioFullVolumeDistance)) gAmbientRadioFullVolumeDistance = 8.0f;
+    if (!std::isfinite(gAmbientRadioVolume)) gAmbientRadioVolume = 1.0f;
+    if (!std::isfinite(gAmbientRadioInCarVolume)) gAmbientRadioInCarVolume = 0.55f;
     if (gAmbientRadioDistance < 5.0f) gAmbientRadioDistance = 5.0f;
     if (gAmbientRadioDistance > 200.0f) gAmbientRadioDistance = 200.0f;
     if (gAmbientRadioFullVolumeDistance < 1.0f) gAmbientRadioFullVolumeDistance = 1.0f;
@@ -1187,6 +1206,7 @@ public:
                 // another plugin races us. Retry from the game loop until it is ready;
                 // without this, one transient init failure leaves all radio streams silent.
                 EnsureBassReady();
+                if (!gBassReady) return;
 
                 CPlayerPed* pPlayer = FindPlayerPed();
                 if (!pPlayer) {
@@ -1231,159 +1251,129 @@ public:
                 if (isPaused && !gWasPaused) {
                     if (gStream) BASS_ChannelPause(gStream);
                     if (gSfxStaticStream) BASS_ChannelPause(gSfxStaticStream);
+                    if (gSfxTuningStream) BASS_ChannelPause(gSfxTuningStream);
                     gWasPaused = true;
                 }
                 else if (!isPaused && gWasPaused) {
                     UpdateVolume();
                     if (gStream) BASS_ChannelPlay(gStream, FALSE);
                     if (gSfxStaticStream) BASS_ChannelPlay(gSfxStaticStream, FALSE);
+                    if (gSfxTuningStream && BASS_ChannelIsActive(gSfxTuningStream) == BASS_ACTIVE_PAUSED)
+                        BASS_ChannelPlay(gSfxTuningStream, FALSE);
                     gWasPaused = false;
                 }
                 if (isPaused) return;
 
-                // Remember the current vehicle so we can save its station on exit
-                // (m_pVehicle is null on the exit frame, and the instant you're
-                // knocked off a bike).
-                if (inVehicle && pVehicle)
-                    gActiveVehicle = pVehicle;
-
-                // Process exit BEFORE any BASS loading, switch debounce or announcement
-                // handling. Previously the exit ran after PlayLoadedStation and could
-                // briefly start radio playback while Claude was already on foot.
-                if (!inVehicle) {
-                    const bool hadPlayerRadio = gWasInVehicle || gStream ||
-                        gWaitingToPlay || gPendingStation != -1;
-                    if (gWasInVehicle)
-                        OnPlayerExitVehicle(gActiveVehicle);
-                    if (hadPlayerRadio) {
+                // Handle normal exit AND an instantaneous vehicle-to-vehicle
+                // transition. Resolve the old pool handle instead of dereferencing
+                // a raw vehicle pointer that may already have been recycled.
+                const int vehicleRef = inVehicle && CPools::ms_pVehiclePool ?
+                    CPools::GetVehicleRef(pVehicle) : -1;
+                // Process exit BEFORE queued decoder playback or announcements.
+                if (!inVehicle || vehicleRef != gActiveVehicleRef) {
+                    if (gWasInVehicle && !gNoRadioVehicle && !gPoliceRadioPlaying) {
+                        CVehicle* previous = gActiveVehicleRef >= 0 && CPools::ms_pVehiclePool ?
+                            CPools::GetVehicle(gActiveVehicleRef) : nullptr;
+                        OnPlayerExitVehicle(previous);
+                    }
+                    if (gWasInVehicle || gStream || gWaitingToPlay || gPendingStation != -1) {
                         StopRadio();
                         StopStaticSound();
                         CancelPendingStationLoad();
                     }
-                    gActiveVehicle = nullptr;
+                    gActiveVehicleRef = -1;
                     gWasInVehicle = false;
                     gNoRadioVehicle = false;
                     gPoliceRadioPlaying = false;
+                    gPoliceOverrideActive = false;
                     gCurrentStation = -1;
                     gPendingStation = -1;
                     gLastSwitchTick = 0;
-                    gLastNativeStation = -1;
-                    gWaitingToPlay = false;
                     gForcedSeekStation = -1;
                     gAnnouncementPlaying = false;
                     gStationNameToShow.clear();
                     gSwitchNext = gSwitchPrev = gRadioOff = false;
-                    // Do not consume queued native bridge announcements here:
-                    // they can be issued by SCM while Claude is on foot.
-                    UpdateVolume();
-                    return;
+                    if (!inVehicle) {
+                        UpdateVolume();
+                        return; // queued bridge broadcasts can wait until driving
+                    }
                 }
+                gActiveVehicleRef = vehicleRef;
 
-                // ===== No-radio vehicles ([NORADIO] section): total silence =====
-                // Checked before everything else so it overrides music, police
-                // radio and announcements alike.
-                if (inVehicle && pVehicle && IsNoRadioVehicle(pVehicle->m_nModelIndex)) {
+                if (IsNoRadioVehicle(pVehicle->m_nModelIndex)) {
                     if (!gNoRadioVehicle) {
                         CancelPendingStationLoad();
                         StopRadio();
                         StopStaticSound();
                         gNoRadioVehicle = true;
-                        gWasInVehicle = true;        // suppress the seated-detection path
-                        gPoliceRadioPlaying = false;
-                        gCurrentStation = -1;
-                        gPendingStation = -1;
-                        gLastSwitchTick = 0;
-                        gWaitingToPlay = false;
-                        gBufferReady = false;
-                        gAnnouncementPlaying = false;
-                        gStationNameToShow = "";     // no banner
-                        gLog << "No-radio vehicle (model " << pVehicle->m_nModelIndex << "): radio disabled" << std::endl;
-                        gLog.flush();
+                        gWasInVehicle = true;
+                        gStationNameToShow.clear();
+                        gLog << "No-radio vehicle (model " << pVehicle->m_nModelIndex << ")" << std::endl;
                     }
-                    // Swallow any input or queued announcement so nothing can turn it on.
-                    gSwitchNext = false;
-                    gSwitchPrev = false;
-                    gPendingAnnouncement.exchange(-1);
-                    gQueuedAnnouncement = -1;
+                    ForceNativeRadioOff(pVehicle);
+                    gSwitchNext = gSwitchPrev = gRadioOff = false;
                     gPendingScmStation.exchange(-1);
                     gPendingScmStationTime.exchange(-1);
                     UpdateVolume();
                     return;
                 }
 
-                if (inVehicle && pVehicle && pVehicle->IsLawEnforcementVehicle()) {
+                if (gMusicManager.UsesPoliceRadio(pVehicle)) {
                     if (!gPoliceRadioPlaying) {
+                        CancelPendingStationLoad();
                         StopRadio();
                         StopStaticSound();
-                        std::string policePath = gGameFolder + "audio\\police.mp3";
-                        gStream = BASS_StreamCreateFile(FALSE, policePath.c_str(), 0, 0, BASS_SAMPLE_LOOP);
-                        if (gStream) {
-                            unsigned char vol = GetMusicVolume();
-                            gLastVolume = vol;
-                            BASS_ChannelSetAttribute(gStream, BASS_ATTRIB_VOL, RadioVolume(vol));
-                            BASS_ChannelPlay(gStream, FALSE);
-                            gLog << "Police radio started" << std::endl;
-                            gLog.flush();
-                        }
+                        gWasInVehicle = true;
                         gPoliceRadioPlaying = true;
+                        gCurrentStation = gPendingStation = -1;
+                        gStationNameToShow.clear();
+                        const std::string policePath = gGameFolder + "audio\\police.mp3";
+                        if (FileExists(policePath))
+                            gStream = BASS_StreamCreateFile(FALSE, policePath.c_str(), 0, 0, BASS_SAMPLE_LOOP);
+                        if (gStream) {
+                            BASS_ChannelSetAttribute(gStream, BASS_ATTRIB_VOL, RadioVolume(GetMusicVolume()));
+                            gPoliceOverrideActive = BASS_ChannelPlay(gStream, FALSE) != FALSE;
+                            if (!gPoliceOverrideActive) StopRadio();
+                        }
+                        if (!gPoliceOverrideActive && gMusicManager.m_nMusicMode == RadioPolicy::NativeGameMode &&
+                            !gMusicManager.m_bAnnouncementInProgress)
+                            gMusicManager.m_bSetNextStation = true; // native police fallback
+                        gLog << "Police vehicle: " << (gPoliceOverrideActive ? "custom police.mp3" : "native police radio") << std::endl;
                     }
+                    if (gPoliceOverrideActive && (!gStream || BASS_ChannelIsActive(gStream) == BASS_ACTIVE_STOPPED)) {
+                        StopRadio();
+                        gPoliceOverrideActive = false;
+                        if (gMusicManager.m_nMusicMode == RadioPolicy::NativeGameMode &&
+                            !gMusicManager.m_bAnnouncementInProgress)
+                            gMusicManager.m_bSetNextStation = true;
+                    }
+                    ForceNativeRadioOff(pVehicle); // only if custom playback, never native police fallback
+                    gSwitchNext = gSwitchPrev = gRadioOff = false;
+                    gPendingScmStation.exchange(-1);
+                    gPendingScmStationTime.exchange(-1);
                     UpdateVolume();
                     return;
                 }
 
-                if (gPoliceRadioPlaying) {
-                    StopRadio();
-                    gPoliceRadioPlaying = false;
-                    gWasInVehicle = false;
-                    gCurrentStation = -1;
-                    gWaitingToPlay = false;
-                }
-
-                if (inVehicle)
-                    ForceNativeRadioOff(pVehicle);
-
-                // Detect SCM opcode station changes via native radio byte
-                if (inVehicle && pVehicle) {
-                    int nativeStation = pVehicle->m_nRadioStation;
-                    if (nativeStation != 10 && nativeStation != gLastNativeStation && gWasInVehicle) {
-                        if (nativeStation >= 0 && nativeStation < (int)stations.size()) {
-                            gLastNativeStation = nativeStation;
-                            StopRadio();
-                            {
-                                std::lock_guard<std::mutex> lock(gLoadMutex);
-                                gLoadedBuffer.clear();
-                            }
-                            CancelPendingStationLoad();
-                            gPendingStation = -1;
-                            gLastSwitchTick = 0;
-                            gCurrentStation = nativeStation;
-                            StartLoadingStation(nativeStation);
-                            gLog << "SCM: station set to [" << stations[nativeStation].name << "]" << std::endl;
-                            gLog.flush();
-                        }
-                    }
-                    // Force the native radio state back to off every frame after reading.
-                    // This prevents the native audio system and HUD from acting on any value
-                    // the game may have written here due to mouse wheel or other input.
-                    ForceNativeRadioOff(pVehicle);
-                }
-                else {
-                    gLastNativeStation = -1;
-                }
-
-                bool isSeated = (pPlayer->m_pVehicle != nullptr);
-
-                if (isSeated && !gWasInVehicle && pVehicle) {
+                ForceNativeRadioOff(pVehicle);
+                // Native byte is now strictly a suppression sentinel, NOT a
+                // custom station index. SCM requests come from the opcode hook.
+                // Do not accidentally interpret 10 (police) as a custom station.
+                if (!gWasInVehicle) {
                     gWasInVehicle = true;
-                    int station = GetStationForVehicle(pVehicle);
+                    bool inheritedNpc = false;
+                    const int station = GetStationForVehicle(pVehicle, &inheritedNpc);
                     StopRadio();
-                    {
-                        std::lock_guard<std::mutex> lock(gLoadMutex);
-                        gLoadedBuffer.clear();
-                    }
                     CancelPendingStationLoad();
                     gCurrentStation = station;
-                    StartLoadingStation(station);
+                    if (station >= 0) {
+                        // The exterior stream uses the same station clock. Do
+                        // not restart a broadcast at a first-listen cue upon entry.
+                        if (inheritedNpc) gStationAnchorDelta.emplace(station, 0.0);
+                        StartLoadingStation(station);
+                    } else {
+                        TurnRadioOff();
+                    }
                 }
 
                 if (gWasInVehicle && gWaitingToPlay && gBufferReady) {
@@ -1430,11 +1420,13 @@ public:
                         // like the native announcement ("radio cannot be switched").
                         gSwitchNext = false;
                         gSwitchPrev = false;
+                        gRadioOff = false;
                         UpdateVolume();
                         return;
                     }
                 }
-                else if (gQueuedAnnouncement != -1 && gWasInVehicle && inVehicle) {
+                else if (gQueuedAnnouncement != -1 && gWasInVehicle && inVehicle &&
+                    (gCurrentStation >= 0 || gPendingStation >= 0)) {
                     int ann = gQueuedAnnouncement;
                     gQueuedAnnouncement = -1;
                     // Stock GTA III uses COMOPEN.WAV / SUBOPEN.WAV. Prefer
@@ -1444,14 +1436,10 @@ public:
                     if (!FileExists(annFile))
                         annFile = gGameFolder + "audio\\" + basename + ".WAV";
 
+                    if (gPendingStation >= 0) gCurrentStation = gPendingStation;
                     StopRadio();
                     StopStaticSound();
-                    {
-                        std::lock_guard<std::mutex> lock(gLoadMutex);
-                        gLoadedBuffer.clear();
-                    }
-                    gBufferReady = false;
-                    gWaitingToPlay = false;
+                    CancelPendingStationLoad();
                     gPendingStation = -1;
                     gLastSwitchTick = 0;
                     gSwitchNext = false;
@@ -1461,7 +1449,7 @@ public:
                     if (gStream) {
                         unsigned char vol = GetMusicVolume();
                         gLastVolume = vol;
-                        BASS_ChannelSetAttribute(gStream, BASS_ATTRIB_VOL, RadioVolume(vol));
+                        BASS_ChannelSetAttribute(gStream, BASS_ATTRIB_VOL, RadioVolume(vol) * gDuckFactor);
                         BASS_ChannelPlay(gStream, FALSE);
                         gAnnouncementPlaying = true;
                         gStationNameToShow = ""; // announcements never show a station banner
@@ -1473,53 +1461,42 @@ public:
                     else {
                         gLog << "Announcement: BASS error " << BASS_ErrorGetCode() << " (" << annFile << ")" << std::endl;
                         gLog.flush();
-                        // File missing/unreadable: fall through to normal radio.
+                        // Restore the selected station immediately on decode failure.
+                        if (gCurrentStation >= 0) StartLoadingStation(gCurrentStation);
                     }
                 }
 
                 // ===== Mission-scripted radio change (SCM opcode 041E) =====
                 // main.scm forces a specific station during some missions. The
                 // hook in Switch.cpp captured the requested index; apply it here.
-                // The request is left pending (load, not consumed) until we're
-                // actually in a car and not mid-load, so it survives the frame the
-                // player first sits down (when the default station is still loading).
+                // Leave requests pending until seated. A mission retune may
+                // supersede an existing decoder request immediately.
                 {
                     int scmStation = gPendingScmStation.load();
-                    if (scmStation >= 0 && inVehicle && gWasInVehicle && !gLoadingInProgress) {
+                    if (scmStation >= 0 && inVehicle && gWasInVehicle) {
                         int scmTime = gPendingScmStationTime.load();
                         gPendingScmStation = -1;     // consume now that we can act on it
                         gPendingScmStationTime = -1;
-                        // 0..8 are the original VC stations (same order as the INI).
-                        // 9/10 mean "off" in VC, and we never map 041E to MP3 PLAYER.
-                        if (scmStation <= 8 && scmStation < (int)stations.size()
-                            && scmStation != gCurrentStation) {
-                            StopRadio();
-                            {
-                                std::lock_guard<std::mutex> lock(gLoadMutex);
-                                gLoadedBuffer.clear();
-                            }
-                            gBufferReady = false;
+                        const int station = RadioPolicy::MapScriptStation(scmStation,
+                            (int)stations.size(), gMp3StationIndex);
+                        if (station == RadioPolicy::Off) {
                             gPendingStation = -1;
                             gLastSwitchTick = 0;
-                            gCurrentStation = scmStation;
-                            // Original VC stations honor the script's exact timecode
-                            // when it gave one (param 2 >= 0); otherwise (and for any
-                            // added stations) we ride the synced clock.
-                            if (scmTime >= 0) {
-                                gForcedSeekStation = scmStation;
-                                gForcedSeekMs = (double)scmTime;
-                                gLog << "SCM 041E: radio -> [" << stations[scmStation].name
-                                    << "] @ " << scmTime << " ms (scripted timecode)" << std::endl;
-                            }
-                            else {
-                                gForcedSeekStation = -1;
-                                gLog << "SCM 041E: radio -> [" << stations[scmStation].name
-                                    << "] (synced clock)" << std::endl;
-                            }
-                            StartLoadingStation(scmStation);
-                            gLog.flush();
+                            TurnRadioOff();
+                        } else if (station >= 0 && (station != gCurrentStation || scmTime >= 0)) {
+                            StopRadio();
+                            StopStaticSound();
+                            CancelPendingStationLoad();
+                            gPendingStation = -1;
+                            gLastSwitchTick = 0;
+                            gCurrentStation = station;
+                            gForcedSeekStation = scmTime >= 0 && station != gMp3StationIndex ? station : -1;
+                            gForcedSeekMs = (double)scmTime;
+                            StartLoadingStation(station);
+                            gLog << "SCM 041E: radio -> [" << stations[station].name << "]" << std::endl;
                         }
-                        // station 9/10 (off), out of range, or unchanged: nothing to do
+                        // Native police 10 (and other non-music IDs) are never
+                        // allowed to become an arbitrary configured music station.
                     }
                 }
 
@@ -1538,7 +1515,7 @@ public:
 
                 // Hold-to-off: the radio-switch button held ~2.5s sets gRadioOff in
                 // Switch.cpp. Turn the radio off — same path as scrolling past the
-                // last station; TurnRadioOff() shows the "Radio Off" banner.
+                // last station; TurnRadioOff() shows the "RADIO OFF" banner.
                 if (gRadioOff) {
                     gRadioOff = false;
                     if (gWasInVehicle) {
@@ -1565,6 +1542,8 @@ public:
                             next = base + (goNext ? 1 : -1);
                         }
 
+                        // A manual switch supersedes any pending script timecode.
+                        gForcedSeekStation = -1;
                         if (gRadioSwitchSfx)
                             PlayTuningSound();
 
@@ -1579,7 +1558,7 @@ public:
                                 StartStaticSound();
 
                             StopRadio();
-
+                            CancelPendingStationLoad();
                             gPendingStation = next;
                             gLastSwitchTick = GetTickCount();
                             gStationNameToShow = stations[next].name;
@@ -1595,11 +1574,6 @@ public:
                         int next = gPendingStation;
                         gPendingStation = -1;
                         gLastSwitchTick = 0;
-                        {
-                            std::lock_guard<std::mutex> lock(gLoadMutex);
-                            gLoadedBuffer.clear();
-                        }
-                        gBufferReady = false;
                         gCurrentStation = next;
                         StartLoadingStation(next);
                         gLog << "Loading: [" << stations[next].name << "]" << std::endl;
@@ -1629,10 +1603,12 @@ public:
                 // A fast-scroll race can briefly set a real native station between our
                 // per-frame cleanup passes; clamping here, just before the HUD renders,
                 // stops the stock radio-name banner flashing top-center behind ours.
-                if (gPlayerInVehicle && gActiveVehicle)
-                    ForceNativeRadioOff(gActiveVehicle);
+                CPlayerPed* player = FindPlayerPed();
+                if (player && player->m_bInVehicle && player->m_pVehicle)
+                    ForceNativeRadioOff(player->m_pVehicle);
 
-                if (!gPlayerInVehicle || gStationNameToShow.empty()) return;
+                if (!gPlayerInVehicle || !player || !player->m_bInVehicle ||
+                    !player->m_pVehicle || gStationNameToShow.empty()) return;
                 if (GetTickCount() - gStationNameTimer > STATION_NAME_DURATION) {
                     gStationNameToShow = "";
                     return;

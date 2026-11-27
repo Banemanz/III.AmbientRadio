@@ -1,6 +1,8 @@
 #include "plugin.h"
 #include "CPad.h"
 #include "CPlayerPed.h"
+#include "RadioPolicy.h"
+#include <cstring>
 #include "cDMAudio.h"
 #include "cMusicManager.h"
 #include "CRunningScript.h"
@@ -42,7 +44,7 @@ std::atomic<int> gPendingScmStation{ -1 };
 
 // The second parameter of 041E: the requested playback position in ms, or -1
 // meaning "continue" (use our synced clock). Main.cpp honors this only for the
-// original VC stations (indices 0..8); added stations always use the clock.
+// original III stations (indices 0..8); added stations always use the clock.
 std::atomic<int> gPendingScmStationTime{ -1 };
 
 // GetTickCount() deadlines until which Main.cpp ducks (dims) the radio, matching
@@ -224,6 +226,7 @@ static BYTE gOrigDisplayRadioStationName[5];
 static bool gNativeAudioAllowed = false; // false = patches applied (suppressed)
 
 extern bool gPlayerInVehicle; // defined in Main.cpp; updated every frame
+bool ShouldSuppressNativeVehicleRadio(CVehicle* vehicle);
 extern std::string gGameFolder;
 
 // Patch targets — never called while the patches are lifted.
@@ -250,6 +253,60 @@ static void ApplyRadioSuppression(bool suppress)
     gNativeAudioAllowed = !suppress;
 }
 
+// Only replace native car-tuning calls inside ServiceGameMode, not the music
+// service, stream manager, or mission/front-end sound functions. Calling the
+// original methods is safe because these hooks patch their CALLs, not entries.
+static bool SuppressCurrentCarTuning()
+{
+    CPlayerPed* player = FindPlayerPed();
+    return player && player->m_bInVehicle && player->m_pVehicle &&
+        ShouldSuppressNativeVehicleRadio(player->m_pVehicle);
+}
+static unsigned char __fastcall Hook_GetCarTuning(cMusicManager* self, void*)
+{
+    if (SuppressCurrentCarTuning()) return RadioPolicy::NativeOff;
+    return self->GetCarTuning();
+}
+static unsigned char __fastcall Hook_GetNextCarTuning(cMusicManager* self, void*)
+{
+    if (SuppressCurrentCarTuning()) return RadioPolicy::NativeOff;
+    return self->GetNextCarTuning();
+}
+static bool gNativeTuningHooksInstalled = false;
+static bool gNativeF9Suppressed = false;
+static void InstallNativeTuningHooks()
+{
+    // Verified against the original GTA III 1.0 US IDB. Never blindly overwrite
+    // another plugin's hooks at these callsites.
+    const unsigned addresses[] = { 0x57D7D8, 0x57D899, 0x57DC3A };
+    const BYTE originals[][5] = {
+        {0xE8,0x53,0x0D,0x00,0x00}, {0xE8,0x02,0x0D,0x00,0x00},
+        {0xE8,0xF1,0x08,0x00,0x00}
+    };
+    bool valid = true;
+    for (int i = 0; i < 3; ++i) {
+        BYTE actual[5]{};
+        injector::ReadMemoryRaw(addresses[i], actual, sizeof(actual), true);
+        if (std::memcmp(actual, originals[i], sizeof(actual)) != 0) valid = false;
+    }
+    if (valid) {
+        injector::MakeCALL(addresses[0], Hook_GetCarTuning, true);
+        injector::MakeCALL(addresses[1], Hook_GetNextCarTuning, true);
+        injector::MakeCALL(addresses[2], Hook_GetCarTuning, true);
+        gNativeTuningHooksInstalled = true;
+    }
+    // F9 independently forces native MP3 directly, bypassing the normal radio
+    // switch functions. Skip ONLY this game-mode shortcut; the BASS MP3 PLAYER
+    // is still selectable through the mod's original controls.
+    BYTE f9[2]{};
+    injector::ReadMemoryRaw(0x57D7EC, f9, sizeof(f9), true);
+    if (f9[0] == 0x74 && f9[1] == 0x68) {
+        BYTE skip[] = {0xEB,0x68};
+        injector::WriteMemoryRaw(0x57D7EC, skip, sizeof(skip), true);
+        gNativeF9Suppressed = true;
+    }
+}
+
 // ---- Native GTA III bridge-announcement interception ----
 // GTA III does not have VC's opcode 057D. The industrial/commercial-passed
 // opcodes call cDMAudio::PlayRadioAnnouncement(13/14) at 0x57CC60.
@@ -258,6 +315,7 @@ static void ApplyRadioSuppression(bool suppress)
 // original cMusicManager path (no silent drop or fabricated VC filenames).
 static void __fastcall Hook_PlayRadioAnnouncement(cDMAudio* self, void*, unsigned char announcement)
 {
+    if (announcement == RadioPolicy::NativePolice && SuppressCurrentCarTuning()) return;
     if (announcement == 13 || announcement == 14) {
         const char* basename = (announcement == 13) ? "COMOPEN" : "SUBOPEN";
         // Stock GTA III PC ships WAV bridge announcements; accept MP3
@@ -373,9 +431,10 @@ public:
         injector::ReadMemoryRaw(0x57CE60, gOrigSetRadioInCar, sizeof(gOrigSetRadioInCar), true);
         injector::ReadMemoryRaw(0x57E6D0, gOrigDisplayRadioStationName, sizeof(gOrigDisplayRadioStationName), true);
         ApplyRadioSuppression(true);
+        InstallNativeTuningHooks();
 
         // Watch the sole CRunningScript::Process -> ProcessOneCommand call for
-        // opcodes 057D (announcements), 041E (mission radio-station changes),
+        // opcodes 041E (mission radio-station changes),
         // 0394/03D1 (audio ducking). We patch the call site instead of using
         // safetyhook, which keeps this compatible with plugin-sdk generator
         // projects that already include their own safetyhook amalgamation.
@@ -393,6 +452,9 @@ public:
                          << (gScriptIntegrationEnabled ? "ENABLED"
                                                        : "DISABLED (SCM hook not installed)")
                          << std::endl;
+                    gLog << "RadioHooks: Native OFF=11, police=10; car tuning hooks "
+                        << (gNativeTuningHooksInstalled ? "ACTIVE" : "signature mismatch (not installed)")
+                        << ", native F9 shortcut " << (gNativeF9Suppressed ? "disabled" : "unchanged") << std::endl;
                     gLog << "RadioHooks: native radio suppression; GTA III bridge hook at 0x57CC60 "
                          << (gScriptIntegrationEnabled ? "ACTIVE" : "DISABLED") << std::endl;
                     gLog.flush();
