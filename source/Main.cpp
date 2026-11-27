@@ -443,11 +443,14 @@ static void StopStaticSound()
 // Workers only publish results when their captured generation still matches.
 static void CancelPendingStationLoad()
 {
+    // Serialize the generation bump with worker publication. A worker that
+    // passed its generation test before a switch cannot subsequently publish
+    // into a newly queued station's staging buffer.
+    std::lock_guard<std::mutex> lock(gLoadMutex);
     gLoadGeneration.fetch_add(1, std::memory_order_acq_rel);
     gLoadingInProgress.store(false, std::memory_order_release);
     gBufferReady.store(false, std::memory_order_release);
     gWaitingToPlay = false;
-    std::lock_guard<std::mutex> lock(gLoadMutex);
     gLoadedBuffer.clear();
 }
 
@@ -653,9 +656,12 @@ static void LoadStationThread(int index, unsigned int generation, double timelin
         std::ifstream f(fullPath, std::ios::binary);
         if (!f.is_open()) {
             QueueRadioWorkerLog("Thread: cannot open " + fullPath);
-            if (gLoadGeneration.load(std::memory_order_acquire) == generation) {
-                gLoadingInProgress.store(false, std::memory_order_release);
-                gBufferReady.store(true, std::memory_order_release); // playback reports missing ADF
+            {
+                std::lock_guard<std::mutex> lock(gLoadMutex);
+                if (gLoadGeneration.load(std::memory_order_acquire) == generation) {
+                    gLoadingInProgress.store(false, std::memory_order_release);
+                    gBufferReady.store(true, std::memory_order_release); // playback reports missing ADF
+                }
             }
             return;
         }
@@ -665,8 +671,14 @@ static void LoadStationThread(int index, unsigned int generation, double timelin
             std::istreambuf_iterator<char>()
         );
 
-        for (auto& b : buf)
-            b ^= 0x22;
+        for (size_t pos = 0; pos < buf.size(); ++pos) {
+            // Cancellation during a large ADF decrypt: don't waste CPU on a
+            // station superseded by repeated radio-wheel inputs.
+            if ((pos & 0xFFFFF) == 0 &&
+                gLoadGeneration.load(std::memory_order_acquire) != generation)
+                return;
+            buf[pos] ^= 0x22;
+        }
     }
 
     QueueRadioWorkerLog("Thread: loaded " + std::to_string(buf.size()) + " bytes");
@@ -683,13 +695,18 @@ static void LoadStationThread(int index, unsigned int generation, double timelin
 static void StartLoadingStation(int index)
 {
     if (index < 0 || index >= (int)stations.size()) return;
-    // Latest requested station wins. Stale workers cannot publish or overwrite
-    // the buffer for a newer request, even if their I/O completes afterward.
-    unsigned int generation = gLoadGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
-    gBufferReady.store(false, std::memory_order_release);
-    gLoadingInProgress.store(true, std::memory_order_release);
-    gLoadingStation = index;
-    gWaitingToPlay = true;
+    unsigned int generation;
+    {
+        // Workers publish under this same lock, so a new request cannot race
+        // between an old worker's generation check and its result publication.
+        std::lock_guard<std::mutex> lock(gLoadMutex);
+        generation = gLoadGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+        gLoadedBuffer.clear();
+        gBufferReady.store(false, std::memory_order_release);
+        gLoadingInProgress.store(true, std::memory_order_release);
+        gLoadingStation = index;
+        gWaitingToPlay = true;
+    }
     std::thread(LoadStationThread, index, generation, gRadioTime).detach();
 }
 

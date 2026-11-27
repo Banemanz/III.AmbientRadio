@@ -27,6 +27,8 @@ require(main.index("BASS_StreamFree(gStream);") < main.index("gActiveStreamBuffe
 require("std::call_once(gMp3DurationsOnce" in main and
         "gMp3DurationsMs[i]" in main,
         "MP3 selection must use cached metadata, not reopen every track")
+require("std::lock_guard<std::mutex> lock(gLoadMutex);\n        generation = gLoadGeneration.fetch_add" in main,
+        "Main thread must serialize generation bump with worker publication")
 require("gLoadGeneration.fetch_add" in main and
         "gLoadGeneration.load(std::memory_order_acquire)" in main,
         "Player radio needs stale-worker cancellation")
