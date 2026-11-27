@@ -68,7 +68,7 @@ if binary.exists():
     data = binary.read_bytes()
     require(data[:2] == b"MZ", "ASI must be a PE DLL")
     off = struct.unpack_from("<I", data, 0x3C)[0]
-    require(data[off:off + 4] == b"PE\\0\\0", "Missing PE signature")
+    require(data[off:off + 4] == b"PE" + bytes((0, 0)), "Missing PE signature")
     machine = struct.unpack_from("<H", data, off + 4)[0]
     require(machine == 0x14C, "ASI must be x86 (GTA III 1.0 US)")
 print("PASS: static hook/stream lifetime/INI/CI checks" +
