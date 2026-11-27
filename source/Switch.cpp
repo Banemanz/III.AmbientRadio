@@ -2,6 +2,11 @@
 #include "CPad.h"
 #include "CPlayerPed.h"
 #include "RadioPolicy.h"
+#include "RadioOccupancy.h"
+#include "CControllerConfigManager.h"
+#include "CMenuManager.h"
+#include "CCutsceneMgr.h"
+#include "CCamera.h"
 #include <cstring>
 #include "cDMAudio.h"
 #include "cMusicManager.h"
@@ -23,6 +28,7 @@ extern std::ofstream gLog;
 // Shared variables — read by Main.cpp
 bool gSwitchNext = false;
 bool gSwitchPrev = false;
+bool gSwitchFromWheel = false;
 
 // Set true when the radio-switch button (keyboard or pad) is HELD ~2.5s — Main.cpp
 // then turns the radio off (the same "Radio Off" state as scrolling past the last
@@ -54,12 +60,42 @@ std::atomic<int> gPendingScmStationTime{ -1 };
 std::atomic<DWORD> gMissionPassedDuckUntil{ 0 };
 std::atomic<DWORD> gDialogueDuckUntil{ 0 };
 
-// CPad::NewMouseControllerState.wheelUp / .wheelDown  (current-frame mouse state).
-// The vehicle audio code reads these directly to detect scroll-wheel radio changes.
-// OldMouseControllerState (0x93690B/C) is the previous-frame copy — that is what
-// was being cleared before, which had no effect on the current frame's input.
-static uint8_t* const pMouseWheelUp   = (uint8_t*)0x8809F3;
-static uint8_t* const pMouseWheelDown = (uint8_t*)0x8809F4;
+// Own both wheel directions before the native mouse-to-controller mapping.
+// The previous gameProcessEvent ran after UpdatePads, allowing the scroll to
+// become an additional vehicle action. Do not interfere with menu/on-foot input.
+static bool gEarlyWheelHookInstalled = false;
+static bool RadioInputAllowed()
+{
+    CPlayerPed* player = FindPlayerPed();
+    return IsRadioSeated(player) && !FrontEndMenuManager.m_bMenuActive &&
+        !FrontEndMenuManager.m_bWantToLoad && !FrontEndMenuManager.m_bWantToRestart &&
+        !CCutsceneMgr::ms_running && !TheCamera.m_bWideScreenOn;
+}
+
+static void CaptureRadioWheel(bool allowed)
+{
+    auto& mouse = CPad::NewMouseControllerState;
+    RadioPolicy::CaptureWheel(allowed, mouse.wheelUp, mouse.wheelDown,
+        gSwitchNext, gSwitchPrev, gSwitchFromWheel);
+}
+
+static void __fastcall Hook_AffectPadFromMouse(CControllerConfigManager* self, void*)
+{
+    CaptureRadioWheel(RadioInputAllowed());
+    self->AffectPadFromMouse(); // original function; only its call site is patched
+}
+
+static void InstallEarlyWheelHook()
+{
+    // CPad::UpdatePads + 0x35: CALL CControllerConfigManager::AffectPadFromMouse.
+    const BYTE expected[] = {0xE8,0x46,0xAA,0x0F,0x00};
+    BYTE actual[5]{};
+    injector::ReadMemoryRaw(0x492755, actual, sizeof(actual), true);
+    if (std::memcmp(actual, expected, sizeof(actual)) == 0) {
+        injector::MakeCALL(0x492755, Hook_AffectPadFromMouse, true);
+        gEarlyWheelHookInstalled = true;
+    }
+}
 
 // Configurable keys
 static int gRadioSwitchNextKey = 82;  // keyboard: R by default
@@ -259,7 +295,7 @@ static void ApplyRadioSuppression(bool suppress)
 static bool SuppressCurrentCarTuning()
 {
     CPlayerPed* player = FindPlayerPed();
-    return player && player->m_bInVehicle && player->m_pVehicle &&
+    return IsRadioSeated(player) &&
         ShouldSuppressNativeVehicleRadio(player->m_pVehicle);
 }
 static unsigned char __fastcall Hook_GetCarTuning(cMusicManager* self, void*)
@@ -432,6 +468,7 @@ public:
         injector::ReadMemoryRaw(0x57E6D0, gOrigDisplayRadioStationName, sizeof(gOrigDisplayRadioStationName), true);
         ApplyRadioSuppression(true);
         InstallNativeTuningHooks();
+        InstallEarlyWheelHook();
 
         // Watch the sole CRunningScript::Process -> ProcessOneCommand call for
         // opcodes 041E (mission radio-station changes),
@@ -455,6 +492,9 @@ public:
                     gLog << "RadioHooks: Native OFF=11, police=10; car tuning hooks "
                         << (gNativeTuningHooksInstalled ? "ACTIVE" : "signature mismatch (not installed)")
                         << ", native F9 shortcut " << (gNativeF9Suppressed ? "disabled" : "unchanged") << std::endl;
+                    gLog << "RadioHooks: pre-mapping scroll capture "
+                        << (gEarlyWheelHookInstalled ? "ACTIVE" : "signature mismatch (late fallback)")
+                        << std::endl;
                     gLog << "RadioHooks: native radio suppression; GTA III bridge hook at 0x57CC60 "
                          << (gScriptIntegrationEnabled ? "ACTIVE" : "DISABLED") << std::endl;
                     gLog.flush();
@@ -478,22 +518,15 @@ public:
                 static bool gBtnWasDown = false;
                 static DWORD gBtnDownTick = 0;
                 static bool gHoldFired = false;
-                CPlayerPed* player = FindPlayerPed();
-                bool inVehicle = player && player->m_bInVehicle && player->m_pVehicle;
-                if (!inVehicle) {
-                    gSwitchNext = gSwitchPrev = gRadioOff = false;
+                if (!RadioInputAllowed()) {
+                    gSwitchNext = gSwitchPrev = gRadioOff = gSwitchFromWheel = false;
                     gBtnWasDown = false;
                     gHoldFired = false;
                     return;
                 }
-                if (*pMouseWheelUp) {
-                    gSwitchNext = true;
-                    *pMouseWheelUp = 0;
-                }
-                if (*pMouseWheelDown) {
-                    gSwitchPrev = true;
-                    *pMouseWheelDown = 0;
-                }
+                // Compatibility fallback if another mod owns the call site.
+                // Do not recapture a wheel event after the early hook consumed it.
+                if (!gEarlyWheelHookInstalled) CaptureRadioWheel(true);
 
                 // Radio-switch button (keyboard key OR controller button): a quick
                 // TAP changes station; a HOLD of ~2.5s turns the radio OFF (same as
@@ -526,7 +559,7 @@ public:
                     }
                 }
                 else if (!btnDown && gBtnWasDown) {     // released
-                    if (!gHoldFired)
+                    if (!gHoldFired && !gSwitchFromWheel)
                         gSwitchNext = true;             // it was a tap -> change station
                 }
                 gBtnWasDown = btnDown;

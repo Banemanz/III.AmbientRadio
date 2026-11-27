@@ -13,6 +13,7 @@ ambient = (root / "source/AmbientCar.cpp").read_text(encoding="utf-8")
 switch = (root / "source/Switch.cpp").read_text(encoding="utf-8")
 vehicles = (root / "source/RadioVehicles.cpp").read_text(encoding="utf-8")
 policy = (root / "source/RadioPolicy.h").read_text(encoding="utf-8")
+occupancy = (root / "source/RadioOccupancy.h").read_text(encoding="utf-8")
 project = (root / "IIIAmbientRadioEXP.vcxproj").read_text(encoding="utf-8")
 workflow = (root / ".github/workflows/build.yml").read_text(encoding="utf-8")
 
@@ -40,10 +41,10 @@ require("CREATE_NEW" in main and "std::ios::trunc" not in main,
         "INI must be created once, never truncate an existing file")
 require("gRadioSwitchSfx = false" in main,
         "Legacy mismatched switch sounds must be opt-in")
-require("if (!gPlayerInVehicle || !player || !player->m_bInVehicle" in main,
+require("if (!gPlayerInVehicle || !IsRadioSeated(player)" in main,
         "Radio banner should not appear on foot")
 require("if (!inVehicle || vehicleRef != gActiveVehicleRef)" in main and
-        main.index("// Process exit BEFORE") < main.index("if (gWasInVehicle && gWaitingToPlay"),
+        main.index("// Process exit BEFORE") < main.index("// Pause the new radio") < main.index("if (gWasInVehicle && gWaitingToPlay"),
         "Exit must run before queued playback")
 require("plugin::CallMethod<0x5680E0" not in main,
         "Do not stop shared streamed audio channel zero every frame")
@@ -58,7 +59,7 @@ require("if (op != 0x041E && op != 0x0394 && op != 0x03D1)" in switch and
         "Do not misidentify a nonexistent GTA III opcode")
 require(re.search(r'if \(op == 0x03D1\)[\s\S]{0,130}gDialogueDuckUntil', switch),
         "Mission-audio opcode has no arguments")
-require("gSwitchNext = gSwitchPrev = gRadioOff = false;" in switch,
+require("gSwitchNext = gSwitchPrev = gRadioOff = gSwitchFromWheel = false;" in switch,
         "Radio inputs must be disabled on foot")
 require("gAmbientReadyBuffer = std::move(ownedAdfBuffer)" in ambient and
         "gAmbientActiveBuffer = std::move(gAmbientReadyBuffer)" in ambient,
@@ -97,11 +98,30 @@ require("GetAmbientStationForVehicle" in ambient and "GetStationForVehicle(pVehi
 require("LoadDecryptedAdf" in main and "LoadDecryptedAdf" in ambient,
         "Both workers use cancellable, bounded-chunk ADF reads")
 require("gAmbientVehicleRef != sCachedVehicleRef" in ambient and
-        "ResolveAmbientVehicle(gAmbientVehicleRef, ownVehicle)" in ambient,
+        "ResolveAmbientVehicle(gAmbientVehicleRef, ownVehicle, player)" in ambient,
         "Never publish obsolete ambient source or play exterior audio from entered car")
-require("RadioPolicy::MapScriptStation" in main and "loadOne(188, gWavStatic)" in main and
+require("RadioPolicy::MapScriptStation" in main and "loadOne(343, gWavTuning)" in main and
         "loadOne(344 + i" not in main,
         "No VC-index or unrelated-SDT audio in station selection")
+require("bool inVehicle = IsRadioSeated(pPlayer)" in main and
+        "IsRadioSeated(player)" in switch and "IsRadioSeated(player)" in ambient and
+        "PEDSTATE_EXIT_CAR" in occupancy and "PEDSTATE_DRAG_FROM_CAR" in occupancy,
+        "All player radio, input, and ambience paths must respect exit animation")
+exit_block = main[main.index("// Process exit BEFORE"):main.index("// Pause the new radio")]
+require(exit_block.index("StopRadio();") < exit_block.index("OnPlayerExitVehicle(previous);") and
+        "CancelPendingStationLoad();" in exit_block and "gWasPaused = false;" in exit_block,
+        "Stop audio before exit bookkeeping, stale work and pause resume")
+require("0x492755" in switch and "{0xE8,0x46,0xAA,0x0F,0x00}" in switch and
+        switch.index("CaptureRadioWheel(RadioInputAllowed());") < switch.index("self->AffectPadFromMouse();") and
+        "if (!gEarlyWheelHookInstalled) CaptureRadioWheel(true);" in switch,
+        "Capture radio scroll before native mapping, with signature-safe fallback")
+require("RadioPolicy::PlaySwitchClick(gRadioSwitchSfx, fromWheel)" in main and
+        "gSfxStaticStream" not in main and "gWavStatic" not in main and
+        "StartStaticSound()" not in main,
+        "Wheel retunes never generate SFX, no looping raw static for other input")
+require("gRetuneCounter = 0;" in main and
+        main.index("gRetuneCounter = 0;") < main.index("RadioPolicy::NativeRadioTrack(gMusicManager.m_nCurrentStreamedSound)"),
+        "Clear stale native retune crackle even when stock stream is already OFF")
 binary = root / "bin/GTA3/Release/III.AmbientRadio.asi"
 if binary.exists():
     data = binary.read_bytes()

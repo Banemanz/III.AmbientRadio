@@ -26,6 +26,29 @@ int main()
     assert(SuppressNativeTuning(false, true, true));
     assert(SuppressNativeTuning(true, true, false));
     assert(NativeRadioTrack(10) && !NativeRadioTrack(11) && !NativeRadioTrack(13));
+    // The engine's physical vehicle flag stays true from initial exit through
+    // the door-closing callback; our radio occupancy must drop immediately.
+    assert(SeatAllowsRadio(true, true, 44)); // driving
+    assert(SeatAllowsRadio(true, true, 45)); // passenger
+    for (int state : {ExitCar, Dragged, Arrested, ExitTrain, EnterTrain,
+                      EnterCar, StealCar, Carjack, Dying, Dead}) {
+        assert(!SeatAllowsRadio(true, true, state));
+    }
+    assert(!SeatAllowsRadio(false, true, 44));
+    assert(!SeatAllowsRadio(true, false, 44));
+    bool up = true, down = false, next = false, prev = false, wheel = false;
+    assert(!CaptureWheel(false, up, down, next, prev, wheel)); // on foot/menu
+    assert(up && !next && !wheel);
+    assert(CaptureWheel(true, up, down, next, prev, wheel));
+    assert(!up && !down && next && !prev && wheel);
+    assert(!CaptureWheel(true, up, down, next, prev, wheel)); // no duplicate
+    assert(!PlaySwitchClick(true, wheel)); // legacy SFX=1 cannot play on scroll
+    down = true;
+    assert(CaptureWheel(true, up, down, next, prev, wheel));
+    assert(!up && !down && !next && prev && wheel);
+    assert(!PlaySwitchClick(true, wheel));
+    assert(PlaySwitchClick(true, false)); // opt-in keyboard/pad click
+    assert(!PlaySwitchClick(false, false));
     stations = {{"A","a.wav"},{"B","b.wav"},{"MP3 PLAYER",""}};
     CVehicle a{90, 0x101}, b{91,0x201}, police{116,0x301};
     CPools::live = {{a.handle,&a},{b.handle,&b},{police.handle,&police}};
@@ -73,5 +96,5 @@ int main()
     assert(!LoadDecryptedAdf(path, got, [&](){return ++calls >= 4;}));
     std::remove(path.c_str());
     assert(!LoadDecryptedAdf(path, got, [](){return false;}));
-    std::cout << "PASS: native III tuning IDs, police isolation, actual per-vehicle NPC handoff, pending/off, recycled handles, MP3-only, chunked ADF cancellation\n";
+    std::cout << "PASS: early exit and silent scroll, native III tuning IDs, police isolation, actual per-vehicle NPC handoff, pending/off, recycled handles, MP3-only, chunked ADF cancellation\n";
 }

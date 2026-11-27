@@ -8,6 +8,7 @@
 #include "CCutsceneMgr.h"
 #include "CCamera.h"
 #include "RadioPolicy.h"
+#include "RadioOccupancy.h"
 #include "RadioFileLoader.h"
 #include "bass\bass.h"
 #include <string>
@@ -300,12 +301,12 @@ static void ResetAmbient()
     gAmbientRetryAfter.store(0, std::memory_order_release);
 }
 
-static CVehicle* ResolveAmbientVehicle(int handle, CVehicle* playerVehicle)
+static CVehicle* ResolveAmbientVehicle(int handle, CVehicle* playerVehicle, CPlayerPed* player)
 {
     if (handle < 0 || !CPools::ms_pVehiclePool) return nullptr;
     CVehicle* vehicle = CPools::GetVehicle(handle);
     return vehicle && vehicle != playerVehicle && vehicle->m_pDriver &&
-        CanVehiclePlayAmbient(vehicle) ? vehicle : nullptr;
+        vehicle->m_pDriver != player && CanVehiclePlayAmbient(vehicle) ? vehicle : nullptr;
 }
 
 static void ProcessAmbientRadio()
@@ -318,11 +319,17 @@ static void ProcessAmbientRadio()
         return;
     }
 
-    const bool seated = player->m_bInVehicle && player->m_pVehicle;
+    const bool seated = IsRadioSeated(player);
+    // Exiting is not a new ambient source: the game keeps the departing
+    // player in the driver's seat until the door/animation callback.
+    if (!seated && player->m_bInVehicle && player->m_pVehicle) {
+        ResetAmbient();
+        return;
+    }
     CVehicle* ownVehicle = seated ? player->m_pVehicle : nullptr;
     // An entry can complete between two scans: stop the exterior source now,
     // without erasing its persistent station assignment.
-    if (gAmbientVehicleRef >= 0 && !ResolveAmbientVehicle(gAmbientVehicleRef, ownVehicle))
+    if (gAmbientVehicleRef >= 0 && !ResolveAmbientVehicle(gAmbientVehicleRef, ownVehicle, player))
         StopAmbientStream();
 
     if (FrontEndMenuManager.m_bMenuActive || CCutsceneMgr::ms_running || TheCamera.m_bWideScreenOn) {
@@ -336,7 +343,7 @@ static void ProcessAmbientRadio()
     const CVector playerPos = player->GetPosition();
     const float rangeSq = gAmbientRadioDistance * gAmbientRadioDistance;
     DWORD now = GetTickCount();
-    CVehicle* closest = ResolveAmbientVehicle(sCachedVehicleRef, ownVehicle);
+    CVehicle* closest = ResolveAmbientVehicle(sCachedVehicleRef, ownVehicle, player);
     float closestSq = closest ? DistanceSq(playerPos, closest->GetPosition()) : rangeSq;
     if (closestSq >= rangeSq) { closest = nullptr; sCachedVehicleRef = -1; }
     // Re-scan at 10Hz; check the cached vehicle's live position each frame to
@@ -351,7 +358,7 @@ static void ProcessAmbientRadio()
         for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; ++i) {
             if (CPools::ms_pVehiclePool->IsFreeSlotAtIndex(i)) continue;
             CVehicle* vehicle = CPools::ms_pVehiclePool->GetAt(i);
-            if (!vehicle || vehicle == ownVehicle || !vehicle->m_pDriver) continue;
+            if (!vehicle || vehicle == ownVehicle || !vehicle->m_pDriver || vehicle->m_pDriver == player) continue;
             float dist = DistanceSq(playerPos, vehicle->GetPosition());
             if (dist >= nextSq || !CanVehiclePlayAmbient(vehicle)) continue;
             next = vehicle; nextSq = dist;
