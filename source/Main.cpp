@@ -1354,7 +1354,7 @@ public:
                     PlayLoadedStation(gLoadingStation);
                 }
 
-                // ===== Radio announcements (opcode 057D: 0 = bclosed, 1 = bopen) =====
+                // ===== GTA III native bridge announcements (13=COMOPEN, 14=SUBOPEN) =====
                 {
                     int req = gPendingAnnouncement.exchange(-1);
                     if (req == 0 || req == 1)

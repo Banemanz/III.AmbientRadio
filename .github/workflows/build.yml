@@ -2,9 +2,13 @@ name: Build GTA III Ambient Radio
 
 on:
   push:
-    branches: [main, 'fix/**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-win32:

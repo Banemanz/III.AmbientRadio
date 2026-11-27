@@ -260,7 +260,8 @@ static void StartAmbientLoad(int stationIndex, CVehicle* pVehicle)
 {
     if (stationIndex < 0 || stationIndex >= (int)stations.size()) return;
     if (gAmbientLoadingInProgress.load(std::memory_order_acquire)) return;
-    if ((int)(GetTickCount() - gAmbientRetryAfter.load(std::memory_order_acquire)) < 0)
+    DWORD retryAfter = gAmbientRetryAfter.load(std::memory_order_acquire);
+    if (retryAfter && (LONG)(GetTickCount() - retryAfter) < 0)
         return;
 
     StopAmbientStream();
@@ -281,7 +282,12 @@ public:
     {
         Events::gameProcessEvent.Add([]()
             {
-                if (!gAmbientRadioEnabled || !gBassReady) return;
+                if (!gAmbientRadioEnabled || !gBassReady) {
+                    if (gAmbientStream || gAmbientVehicle ||
+                        gAmbientLoadingInProgress.load(std::memory_order_acquire))
+                        StopAmbientStream();
+                    return;
+                }
                 CPlayerPed* pPlayer = FindPlayerPed();
                 if (!pPlayer) {
                     StopAmbientStream();
@@ -372,7 +378,12 @@ public:
                 float closestDistSq = sCachedDistSq;
 
                 if (!closestVehicle) {
-                    StopAmbientStream();
+                    // No work when already idle; avoid taking locks and bumping
+                    // worker generations for every empty-vehicle frame.
+                    if (gAmbientStream || gAmbientVehicle ||
+                        gAmbientLoadingInProgress.load(std::memory_order_acquire) ||
+                        gAmbientStreamReady.load(std::memory_order_acquire))
+                        StopAmbientStream();
                     return;
                 }
 

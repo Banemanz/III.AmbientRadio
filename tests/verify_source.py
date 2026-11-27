@@ -55,7 +55,7 @@ require("gSwitchNext = gSwitchPrev = gRadioOff = false;" in switch,
 require("gAmbientReadyBuffer = std::move(ownedAdfBuffer)" in ambient and
         "gAmbientActiveBuffer = std::move(gAmbientReadyBuffer)" in ambient,
         "Ambient decoder buffer lifetime must survive its stream")
-require("gAmbientGeneration.fetch_add" in ambient,
+require("retryAfter && (LONG)(GetTickCount() - retryAfter) < 0" in ambient,\n        "Retry deadline must handle early Windows uptimes and timer rollover")\nrequire("gAmbientGeneration.fetch_add" in ambient,
         "Ambient workers must be cancellable")
 require("gAmbientWasPaused" in ambient and
         "gAmbientLastVolTick" in ambient and "BASS_ATTRIB_PAN" in ambient,
