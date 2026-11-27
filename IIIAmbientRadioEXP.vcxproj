@@ -82,7 +82,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
       <AdditionalDependencies>plugin_iii.lib;bass.lib;Xinput.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(PLUGIN_SDK_DIR)\output\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(PLUGIN_SDK_DIR)\output\lib;$(PLUGIN_SDK_DIR)\shared\bass;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <ImportLibrary>bin\GTA3\Release\IIIAmbientRadioEXP.III.lib</ImportLibrary>
     </Link>
     <PostBuildEvent>
@@ -114,8 +114,8 @@ xcopy /Y "$(TargetPath)" "$(GTA_III_DIR)\scripts"
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>plugin_iii_d.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(PLUGIN_SDK_DIR)\output\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>plugin_iii_d.lib;bass.lib;Xinput.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(PLUGIN_SDK_DIR)\output\lib;$(PLUGIN_SDK_DIR)\shared\bass;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <ImportLibrary>bin\GTA3\Debug\IIIAmbientRadioEXP.III.lib</ImportLibrary>
     </Link>
     <PostBuildEvent>
@@ -132,7 +132,7 @@ xcopy /Y "$(TargetPath)" "$(GTA_III_DIR)\scripts"
   <ItemGroup>
     <ClCompile Include="source\AmbientCar.cpp" />
     <ClCompile Include="source\Main.cpp">
-      <AdditionalIncludeDirectories Condition="'$(Configuration)|$(Platform)'=='Release GTA3|Win32'">\shared\bass;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories Condition="'$(Configuration)|$(Platform)'=='Release GTA3|Win32'">$(PLUGIN_SDK_DIR)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <ClCompile Include="source\RadioIconHud.cpp" />
     <ClCompile Include="source\RadioVehicles.cpp" />

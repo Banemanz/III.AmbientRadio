@@ -1,5 +1,13 @@
 #include "plugin.h"
 #include "CPad.h"
+#include "CPlayerPed.h"
+#include "RadioPolicy.h"
+#include "RadioOccupancy.h"
+#include "CControllerConfigManager.h"
+#include "CMenuManager.h"
+#include "CCutsceneMgr.h"
+#include "CCamera.h"
+#include <cstring>
 #include "cDMAudio.h"
 #include "cMusicManager.h"
 #include "CRunningScript.h"
@@ -20,6 +28,7 @@ extern std::ofstream gLog;
 // Shared variables — read by Main.cpp
 bool gSwitchNext = false;
 bool gSwitchPrev = false;
+bool gSwitchFromWheel = false;
 
 // Set true when the radio-switch button (keyboard or pad) is HELD ~2.5s — Main.cpp
 // then turns the radio off (the same "Radio Off" state as scrolling past the last
@@ -27,7 +36,8 @@ bool gSwitchPrev = false;
 bool gRadioOff = false;
 
 // Set by the SCM opcode hook below when the game's script fires opcode
-// 057D PLAY_ANNOUNCEMENT. -1 = nothing pending; 0 = bclosed, 1 = bopen.
+// Native GTA III bridge announcements: 13 = COMOPEN, 14 = SUBOPEN.
+ // -1 = nothing pending; 0 = COMOPEN, 1 = SUBOPEN.
 // Read (and reset) by Main.cpp on the main thread. The hook runs on the same
 // (main) thread during script processing, so this is never contended, but
 // std::atomic keeps the access well-defined.
@@ -40,7 +50,7 @@ std::atomic<int> gPendingScmStation{ -1 };
 
 // The second parameter of 041E: the requested playback position in ms, or -1
 // meaning "continue" (use our synced clock). Main.cpp honors this only for the
-// original VC stations (indices 0..8); added stations always use the clock.
+// original III stations (indices 0..8); added stations always use the clock.
 std::atomic<int> gPendingScmStationTime{ -1 };
 
 // GetTickCount() deadlines until which Main.cpp ducks (dims) the radio, matching
@@ -50,12 +60,42 @@ std::atomic<int> gPendingScmStationTime{ -1 };
 std::atomic<DWORD> gMissionPassedDuckUntil{ 0 };
 std::atomic<DWORD> gDialogueDuckUntil{ 0 };
 
-// CPad::NewMouseControllerState.wheelUp / .wheelDown  (current-frame mouse state).
-// The vehicle audio code reads these directly to detect scroll-wheel radio changes.
-// OldMouseControllerState (0x93690B/C) is the previous-frame copy — that is what
-// was being cleared before, which had no effect on the current frame's input.
-static uint8_t* const pMouseWheelUp   = (uint8_t*)0x8809F3;
-static uint8_t* const pMouseWheelDown = (uint8_t*)0x8809F4;
+// Own both wheel directions before the native mouse-to-controller mapping.
+// The previous gameProcessEvent ran after UpdatePads, allowing the scroll to
+// become an additional vehicle action. Do not interfere with menu/on-foot input.
+static bool gEarlyWheelHookInstalled = false;
+static bool RadioInputAllowed()
+{
+    CPlayerPed* player = FindPlayerPed();
+    return IsRadioSeated(player) && !FrontEndMenuManager.m_bMenuActive &&
+        !FrontEndMenuManager.m_bWantToLoad && !FrontEndMenuManager.m_bWantToRestart &&
+        !CCutsceneMgr::ms_running && !TheCamera.m_bWideScreenOn;
+}
+
+static void CaptureRadioWheel(bool allowed)
+{
+    auto& mouse = CPad::NewMouseControllerState;
+    RadioPolicy::CaptureWheel(allowed, mouse.wheelUp, mouse.wheelDown,
+        gSwitchNext, gSwitchPrev, gSwitchFromWheel);
+}
+
+static void __fastcall Hook_AffectPadFromMouse(CControllerConfigManager* self, void*)
+{
+    CaptureRadioWheel(RadioInputAllowed());
+    self->AffectPadFromMouse(); // original function; only its call site is patched
+}
+
+static void InstallEarlyWheelHook()
+{
+    // CPad::UpdatePads + 0x35: CALL CControllerConfigManager::AffectPadFromMouse.
+    const BYTE expected[] = {0xE8,0x46,0xAA,0x0F,0x00};
+    BYTE actual[5]{};
+    injector::ReadMemoryRaw(0x492755, actual, sizeof(actual), true);
+    if (std::memcmp(actual, expected, sizeof(actual)) == 0) {
+        injector::MakeCALL(0x492755, Hook_AffectPadFromMouse, true);
+        gEarlyWheelHookInstalled = true;
+    }
+}
 
 // Configurable keys
 static int gRadioSwitchNextKey = 82;  // keyboard: R by default
@@ -222,6 +262,8 @@ static BYTE gOrigDisplayRadioStationName[5];
 static bool gNativeAudioAllowed = false; // false = patches applied (suppressed)
 
 extern bool gPlayerInVehicle; // defined in Main.cpp; updated every frame
+bool ShouldSuppressNativeVehicleRadio(CVehicle* vehicle);
+extern std::string gGameFolder;
 
 // Patch targets — never called while the patches are lifted.
 static void __fastcall Hook_SetRadioInCar(cDMAudio* self, void* edx, unsigned int radio)
@@ -247,16 +289,95 @@ static void ApplyRadioSuppression(bool suppress)
     gNativeAudioAllowed = !suppress;
 }
 
-// ---- SCM opcode interception: radio announcements + mission station changes ----
+// Only replace native car-tuning calls inside ServiceGameMode, not the music
+// service, stream manager, or mission/front-end sound functions. Calling the
+// original methods is safe because these hooks patch their CALLs, not entries.
+static bool SuppressCurrentCarTuning()
+{
+    CPlayerPed* player = FindPlayerPed();
+    return IsRadioSeated(player) &&
+        ShouldSuppressNativeVehicleRadio(player->m_pVehicle);
+}
+static unsigned char __fastcall Hook_GetCarTuning(cMusicManager* self, void*)
+{
+    if (SuppressCurrentCarTuning()) return RadioPolicy::NativeOff;
+    return self->GetCarTuning();
+}
+static unsigned char __fastcall Hook_GetNextCarTuning(cMusicManager* self, void*)
+{
+    if (SuppressCurrentCarTuning()) return RadioPolicy::NativeOff;
+    return self->GetNextCarTuning();
+}
+static bool gNativeTuningHooksInstalled = false;
+static bool gNativeF9Suppressed = false;
+static void InstallNativeTuningHooks()
+{
+    // Verified against the original GTA III 1.0 US IDB. Never blindly overwrite
+    // another plugin's hooks at these callsites.
+    const unsigned addresses[] = { 0x57D7D8, 0x57D899, 0x57DC3A };
+    const BYTE originals[][5] = {
+        {0xE8,0x53,0x0D,0x00,0x00}, {0xE8,0x02,0x0D,0x00,0x00},
+        {0xE8,0xF1,0x08,0x00,0x00}
+    };
+    bool valid = true;
+    for (int i = 0; i < 3; ++i) {
+        BYTE actual[5]{};
+        injector::ReadMemoryRaw(addresses[i], actual, sizeof(actual), true);
+        if (std::memcmp(actual, originals[i], sizeof(actual)) != 0) valid = false;
+    }
+    if (valid) {
+        injector::MakeCALL(addresses[0], Hook_GetCarTuning, true);
+        injector::MakeCALL(addresses[1], Hook_GetNextCarTuning, true);
+        injector::MakeCALL(addresses[2], Hook_GetCarTuning, true);
+        gNativeTuningHooksInstalled = true;
+    }
+    // F9 independently forces native MP3 directly, bypassing the normal radio
+    // switch functions. Skip ONLY this game-mode shortcut; the BASS MP3 PLAYER
+    // is still selectable through the mod's original controls.
+    BYTE f9[2]{};
+    injector::ReadMemoryRaw(0x57D7EC, f9, sizeof(f9), true);
+    if (f9[0] == 0x74 && f9[1] == 0x68) {
+        BYTE skip[] = {0xEB,0x68};
+        injector::WriteMemoryRaw(0x57D7EC, skip, sizeof(skip), true);
+        gNativeF9Suppressed = true;
+    }
+}
+
+// ---- Native GTA III bridge-announcement interception ----
+// GTA III does not have VC's opcode 057D. The industrial/commercial-passed
+// opcodes call cDMAudio::PlayRadioAnnouncement(13/14) at 0x57CC60.
+// If the original COMOPEN.MP3 or SUBOPEN.MP3 exists, queue it for BASS so
+// it plays through our own in-vehicle radio. If absent, retain the game's
+// original cMusicManager path (no silent drop or fabricated VC filenames).
+static void __fastcall Hook_PlayRadioAnnouncement(cDMAudio* self, void*, unsigned char announcement)
+{
+    if (announcement == RadioPolicy::NativePolice && SuppressCurrentCarTuning()) return;
+    if (announcement == 13 || announcement == 14) {
+        const char* basename = (announcement == 13) ? "COMOPEN" : "SUBOPEN";
+        // Stock GTA III PC ships WAV bridge announcements; accept MP3
+        // replacements without requiring a separate modded audio archive.
+        std::string mp3 = gGameFolder + "audio\\" + basename + ".MP3";
+        std::string wav = gGameFolder + "audio\\" + basename + ".WAV";
+        DWORD attributesMp3 = GetFileAttributesA(mp3.c_str());
+        DWORD attributesWav = GetFileAttributesA(wav.c_str());
+        bool hasMp3 = attributesMp3 != INVALID_FILE_ATTRIBUTES &&
+            !(attributesMp3 & FILE_ATTRIBUTE_DIRECTORY);
+        bool hasWav = attributesWav != INVALID_FILE_ATTRIBUTES &&
+            !(attributesWav & FILE_ATTRIBUTE_DIRECTORY);
+        if (hasMp3 || hasWav) {
+            gPendingAnnouncement.store(announcement == 13 ? 0 : 1, std::memory_order_release);
+            return;
+        }
+    }
+    gMusicManager.PlayAnnouncement(announcement);
+}
+
+// ---- SCM opcode interception: mission station changes + dialogue/tune ducking ----
 //
-// The game's script (main.scm) fires:
-//   * 057D PLAY_ANNOUNCEMENT  at fixed story moments (game start -> "bridges
-//     closed / storm"; after Phnom Penh '86 -> "bridges open / hurricane gone").
-//   * 041E SET_RADIO_CHANNEL  during some missions, to force the car radio to a
-//     specific station. (Param 1 = station index 0..8; 9/10 = off.)
-// Both store their relevant value as the FIRST opcode parameter, so one decoder
-// handles both. We hand the value to Main.cpp, which plays the matching audio
-// (announcement MP3, or the requested station) over the new BASS radio.
+// 041E SET_RADIO_CHANNEL: game script forces an in-car station and timecode.
+ // 0394 PLAY_MISSION_PASSED_TUNE: native stream; only duck BASS.
+ // 03D1 PLAY_MISSION_AUDIO: parameterless; only duck BASS.
+ // GTA III bridge openings are handled by the separate native hook above.
 //
 // We hook the single CRunningScript::Process call site that dispatches
 // ProcessOneCommand. The wrapper peeks at the current opcode, then calls the
@@ -302,11 +423,15 @@ static void PeekScmCommand(CRunningScript* self)
     const unsigned char* ss = CTheScripts::ScriptSpace;
     // Opcode is the low 15 bits; high bit is the "not" flag.
     unsigned short op = (*(const unsigned short*)(ss + ip)) & 0x7FFF;
-    if (op != 0x057D && op != 0x041E && op != 0x0394 && op != 0x03D1)
+    if (op != 0x041E && op != 0x0394 && op != 0x03D1)
         return;
 
-    if (op == 0x0394) {          // PLAY_MISSION_PASSED_TUNE -> duck the radio for the jingle
+    if (op == 0x0394) {          // PLAY_MISSION_PASSED_TUNE -> native channel 0
         gMissionPassedDuckUntil = GetTickCount() + 5000;
+        return;
+    }
+    if (op == 0x03D1) {          // PLAY_MISSION_AUDIO has NO opcode parameters
+        gDialogueDuckUntil = GetTickCount() + 5000;
         return;
     }
 
@@ -314,16 +439,6 @@ static void PeekScmCommand(CRunningScript* self)
     int first;
     if (!ReadScmInt(self, ss, &off, &first, nullptr))
         return;                  // unsupported param — leave it to the game
-
-    if (op == 0x03D1) {          // PLAY_MISSION_AUDIO (mission dialogue) -> duck; refreshed per line
-        gDialogueDuckUntil = GetTickCount() + 5000;
-        return;
-    }
-
-    if (op == 0x057D) {          // PLAY_ANNOUNCEMENT: param 1 = announcement id
-        gPendingAnnouncement = first;
-        return;
-    }
 
     // 041E SET_RADIO_CHANNEL: param 1 = station index, param 2 = play timecode
     // in ms (-1 = continue). Decode param 2 (immediate OR variable); it stays -1
@@ -352,15 +467,19 @@ public:
         injector::ReadMemoryRaw(0x57CE60, gOrigSetRadioInCar, sizeof(gOrigSetRadioInCar), true);
         injector::ReadMemoryRaw(0x57E6D0, gOrigDisplayRadioStationName, sizeof(gOrigDisplayRadioStationName), true);
         ApplyRadioSuppression(true);
+        InstallNativeTuningHooks();
+        InstallEarlyWheelHook();
 
         // Watch the sole CRunningScript::Process -> ProcessOneCommand call for
-        // opcodes 057D (announcements), 041E (mission radio-station changes),
+        // opcodes 041E (mission radio-station changes),
         // 0394/03D1 (audio ducking). We patch the call site instead of using
         // safetyhook, which keeps this compatible with plugin-sdk generator
         // projects that already include their own safetyhook amalgamation.
         gScriptIntegrationEnabled = ReadScriptIntegrationFlag();
-        if (gScriptIntegrationEnabled)
+        if (gScriptIntegrationEnabled) {
             injector::MakeCALL(0x439485, Hook_ProcessOneCommand, true);
+            injector::MakeJMP(0x57CC60, (void*)Hook_PlayRadioAnnouncement, true);
+        }
 
         Events::initGameEvent.Add([]()
             {
@@ -370,7 +489,14 @@ public:
                          << (gScriptIntegrationEnabled ? "ENABLED"
                                                        : "DISABLED (SCM hook not installed)")
                          << std::endl;
-                    gLog << "RadioHooks: SetRadioInCar and DisplayRadioStationName suppression active" << std::endl;
+                    gLog << "RadioHooks: Native OFF=11, police=10; car tuning hooks "
+                        << (gNativeTuningHooksInstalled ? "ACTIVE" : "signature mismatch (not installed)")
+                        << ", native F9 shortcut " << (gNativeF9Suppressed ? "disabled" : "unchanged") << std::endl;
+                    gLog << "RadioHooks: pre-mapping scroll capture "
+                        << (gEarlyWheelHookInstalled ? "ACTIVE" : "signature mismatch (late fallback)")
+                        << std::endl;
+                    gLog << "RadioHooks: native radio suppression; GTA III bridge hook at 0x57CC60 "
+                         << (gScriptIntegrationEnabled ? "ACTIVE" : "DISABLED") << std::endl;
                     gLog.flush();
                 }
             });
@@ -386,16 +512,21 @@ public:
                 if (allowNative != gNativeAudioAllowed)
                     ApplyRadioSuppression(!allowNative);
 
-                // Consume wheel bytes immediately so the native VC radio code path
-                // (which runs later in CGame::Process via DMAudio) never sees them.
-                if (*pMouseWheelUp) {
-                    gSwitchNext = true;
-                    *pMouseWheelUp = 0;
+                // Only consume radio input while actually seated. On foot the wheel
+                // is used for weapon switching; clearing it there broke the controls
+                // and left deferred station changes visible outside vehicles.
+                static bool gBtnWasDown = false;
+                static DWORD gBtnDownTick = 0;
+                static bool gHoldFired = false;
+                if (!RadioInputAllowed()) {
+                    gSwitchNext = gSwitchPrev = gRadioOff = gSwitchFromWheel = false;
+                    gBtnWasDown = false;
+                    gHoldFired = false;
+                    return;
                 }
-                if (*pMouseWheelDown) {
-                    gSwitchPrev = true;
-                    *pMouseWheelDown = 0;
-                }
+                // Compatibility fallback if another mod owns the call site.
+                // Do not recapture a wheel event after the early hook consumed it.
+                if (!gEarlyWheelHookInstalled) CaptureRadioWheel(true);
 
                 // Radio-switch button (keyboard key OR controller button): a quick
                 // TAP changes station; a HOLD of ~2.5s turns the radio OFF (same as
@@ -415,9 +546,6 @@ public:
                 }
                 bool btnDown = keyDown || padDown;
 
-                static bool gBtnWasDown = false;
-                static DWORD gBtnDownTick = 0;
-                static bool gHoldFired = false;
                 const DWORD RADIO_OFF_HOLD_MS = 2500;
 
                 if (btnDown && !gBtnWasDown) {          // press started
@@ -431,7 +559,7 @@ public:
                     }
                 }
                 else if (!btnDown && gBtnWasDown) {     // released
-                    if (!gHoldFired)
+                    if (!gHoldFired && !gSwitchFromWheel)
                         gSwitchNext = true;             // it was a tap -> change station
                 }
                 gBtnWasDown = btnDown;

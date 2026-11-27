@@ -1,0 +1,134 @@
+"""Static regression checks for the GTA III 1.0 US audio plugin.
+
+These are deliberately not presented as in-game tests: GitHub Actions has no
+GTA III executable, game audio archives or runtime to exercise native hooks.
+"""
+from pathlib import Path
+import re
+import struct
+
+root = Path(__file__).resolve().parents[1]
+main = (root / "source/Main.cpp").read_text(encoding="utf-8")
+ambient = (root / "source/AmbientCar.cpp").read_text(encoding="utf-8")
+switch = (root / "source/Switch.cpp").read_text(encoding="utf-8")
+vehicles = (root / "source/RadioVehicles.cpp").read_text(encoding="utf-8")
+policy = (root / "source/RadioPolicy.h").read_text(encoding="utf-8")
+occupancy = (root / "source/RadioOccupancy.h").read_text(encoding="utf-8")
+project = (root / "IIIAmbientRadioEXP.vcxproj").read_text(encoding="utf-8")
+workflow = (root / ".github/workflows/build.yml").read_text(encoding="utf-8")
+
+def require(condition, explanation):
+    if not condition:
+        raise AssertionError(explanation)
+
+require("QueueRadioWorkerLog" in ambient and "FlushRadioWorkerLogs();" in main,
+        "Background diagnostics must be serialized on the game thread")
+require("gActiveStreamBuffer = std::move(gLoadedBuffer)" in main,
+        "Player audio must own memory separately from the worker staging buffer")
+require(main.index("BASS_StreamFree(gStream);") < main.index("gActiveStreamBuffer.clear();"),
+        "Player stream must be freed before the backing memory")
+require("std::call_once(gMp3DurationsOnce" in main and
+        "gMp3DurationsMs[i]" in main,
+        "MP3 selection must use cached metadata, not reopen every track")
+require("std::lock_guard<std::mutex> lock(gLoadMutex);\n        generation = gLoadGeneration.fetch_add" in main,
+        "Main thread must serialize generation bump with worker publication")
+require("gLoadGeneration.fetch_add" in main and
+        "gLoadGeneration.load(std::memory_order_acquire)" in main,
+        "Player radio needs stale-worker cancellation")
+require("StartLoadingStation(0);" not in main,
+        "Do not load default radio station when on foot")
+require("CREATE_NEW" in main and "std::ios::trunc" not in main,
+        "INI must be created once, never truncate an existing file")
+require("gRadioSwitchSfx = false" in main,
+        "Legacy mismatched switch sounds must be opt-in")
+require("if (!gPlayerInVehicle || !IsRadioSeated(player)" in main,
+        "Radio banner should not appear on foot")
+require("if (!inVehicle || vehicleRef != gActiveVehicleRef)" in main and
+        main.index("// Process exit BEFORE") < main.index("// Pause the new radio") < main.index("if (gWasInVehicle && gWaitingToPlay"),
+        "Exit must run before queued playback")
+require("plugin::CallMethod<0x5680E0" not in main,
+        "Do not stop shared streamed audio channel zero every frame")
+require('basename + ".WAV"' in main and
+        '"COMOPEN" : "SUBOPEN"' in main and
+        'basename + ".WAV"' in switch,
+        "Stock GTA III WAV bridge broadcasts must be supported")
+require("Hook_PlayRadioAnnouncement" in switch and "0x57CC60" in switch,
+        "Hook native GTA III announcement dispatch")
+require("if (op != 0x041E && op != 0x0394 && op != 0x03D1)" in switch and
+        "op == 0x057D" not in switch,
+        "Do not misidentify a nonexistent GTA III opcode")
+require(re.search(r'if \(op == 0x03D1\)[\s\S]{0,130}gDialogueDuckUntil', switch),
+        "Mission-audio opcode has no arguments")
+require("gSwitchNext = gSwitchPrev = gRadioOff = gSwitchFromWheel = false;" in switch,
+        "Radio inputs must be disabled on foot")
+require("gAmbientReadyBuffer = std::move(ownedAdfBuffer)" in ambient and
+        "gAmbientActiveBuffer = std::move(gAmbientReadyBuffer)" in ambient,
+        "Ambient decoder buffer lifetime must survive its stream")
+require("retryAfter && (LONG)(GetTickCount() - retryAfter) < 0" in ambient,
+        "Retry deadline must handle early Windows uptimes and timer rollover")
+require("gAmbientGeneration.fetch_add" in ambient,
+        "Ambient workers must be cancellable")
+require("gAmbientWasPaused" in ambient and
+        "gAmbientLastVolTick" in ambient and "BASS_ATTRIB_PAN" in ambient,
+        "Ambient playback should resume once and have stereo positioning")
+require("$(PLUGIN_SDK_DIR)\\shared\\bass" in project,
+        "MSBuild must find pinned SDK BASS library")
+require("624a6a49265fd7a6fc63bda1611013ceabeacb8a" in workflow and
+        "windows-2022" in workflow,
+        "CI must use the pinned Oct 25, 2025 Plugin-SDK on Windows")
+
+require("gAmbientRadioDistance = 20.0f" in main and "AmbientRadioDistance=20.0" in main,
+        "The runtime and new INI use the 20-unit default")
+require('gStationNameToShow = "RADIO OFF";' in main,
+        "Radio OFF HUD must be uppercase")
+require("NativePolice = 10" in policy and "NativeOff = 11" in policy and
+        "vehicle->m_nRadioStation = RadioPolicy::NativeOff" in main and
+        "m_nRadioStation = 10" not in main and "m_nRadioInCar = 10" not in main,
+        "Native OFF must never select POLICE.WAV")
+require("gMusicManager.m_bSetNextStation = true" in main and
+        "m_nCurrentStreamedSound =" not in main and "gMusicManager.m_bDoTrackService =" not in main,
+        "Request native transition instead of clobbering active stream or mission service")
+require(all(address in switch for address in ("0x57D7D8", "0x57D899", "0x57DC3A", "0x57D7EC")) and
+        "std::memcmp" in switch and "return RadioPolicy::NativeOff" in switch,
+        "Verified tuning callsites and F9 bypass must avoid stock playback")
+require("GetAmbientStationForVehicle" in ambient and "GetStationForVehicle(pVehicle, &inheritedNpc)" in main
+        and "SaveAssignment(vehicle, station, true)" in vehicles and "CPools::GetVehicle(handle)" in vehicles
+        and "gAmbientVehicle == pVehicle" not in vehicles,
+        "NPC assignment is persistent across audibility/entry, independent of event ordering")
+require("LoadDecryptedAdf" in main and "LoadDecryptedAdf" in ambient,
+        "Both workers use cancellable, bounded-chunk ADF reads")
+require("gAmbientVehicleRef != sCachedVehicleRef" in ambient and
+        "ResolveAmbientVehicle(gAmbientVehicleRef, ownVehicle, player)" in ambient,
+        "Never publish obsolete ambient source or play exterior audio from entered car")
+require("RadioPolicy::MapScriptStation" in main and "loadOne(343, gWavTuning)" in main and
+        "loadOne(344 + i" not in main,
+        "No VC-index or unrelated-SDT audio in station selection")
+require("bool inVehicle = IsRadioSeated(pPlayer)" in main and
+        "IsRadioSeated(player)" in switch and "IsRadioSeated(player)" in ambient and
+        "PEDSTATE_EXIT_CAR" in occupancy and "PEDSTATE_DRAG_FROM_CAR" in occupancy,
+        "All player radio, input, and ambience paths must respect exit animation")
+exit_block = main[main.index("// Process exit BEFORE"):main.index("// Pause the new radio")]
+require(exit_block.index("StopRadio();") < exit_block.index("OnPlayerExitVehicle(previous);") and
+        "CancelPendingStationLoad();" in exit_block and "gWasPaused = false;" in exit_block,
+        "Stop audio before exit bookkeeping, stale work and pause resume")
+require("0x492755" in switch and "{0xE8,0x46,0xAA,0x0F,0x00}" in switch and
+        switch.index("CaptureRadioWheel(RadioInputAllowed());") < switch.index("self->AffectPadFromMouse();") and
+        "if (!gEarlyWheelHookInstalled) CaptureRadioWheel(true);" in switch,
+        "Capture radio scroll before native mapping, with signature-safe fallback")
+require("RadioPolicy::PlaySwitchClick(gRadioSwitchSfx, fromWheel)" in main and
+        "gSfxStaticStream" not in main and "gWavStatic" not in main and
+        "StartStaticSound()" not in main,
+        "Wheel retunes never generate SFX, no looping raw static for other input")
+require("gRetuneCounter = 0;" in main and
+        main.index("gRetuneCounter = 0;") < main.index("RadioPolicy::NativeRadioTrack(gMusicManager.m_nCurrentStreamedSound)"),
+        "Clear stale native retune crackle even when stock stream is already OFF")
+binary = root / "bin/GTA3/Release/III.AmbientRadio.asi"
+if binary.exists():
+    data = binary.read_bytes()
+    require(data[:2] == b"MZ", "ASI must be a PE DLL")
+    off = struct.unpack_from("<I", data, 0x3C)[0]
+    require(data[off:off + 4] == b"PE" + bytes((0, 0)), "Missing PE signature")
+    machine = struct.unpack_from("<H", data, off + 4)[0]
+    require(machine == 0x14C, "ASI must be x86 (GTA III 1.0 US)")
+print("PASS: static hook/stream lifetime/INI/CI checks" +
+      (" and x86 PE build" if binary.exists() else " (source only)"))

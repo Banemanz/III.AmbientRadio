@@ -5,6 +5,11 @@
 #include "CVector.h"
 #include "CMenuManager.h"
 #include "CPools.h"
+#include "CCutsceneMgr.h"
+#include "CCamera.h"
+#include "RadioPolicy.h"
+#include "RadioOccupancy.h"
+#include "RadioFileLoader.h"
 #include "bass\bass.h"
 #include <string>
 #include <vector>
@@ -27,8 +32,8 @@ extern std::vector<RadioStation> stations;
 extern double gRadioTime;
 extern std::string gGameFolder;
 extern std::ofstream gLog;
+extern void QueueRadioWorkerLog(const std::string& message);
 extern bool gBassReady;
-extern bool gPlayerInVehicle;
 extern float gAmbientRadioDistance;
 extern float gAmbientRadioFullVolumeDistance;
 extern float gAmbientRadioVolume;
@@ -38,8 +43,8 @@ extern bool gAmbientRadioCompressor;
 extern bool gAmbientRadioReverb;
 
 // Declared in RadioVehicles.cpp
-extern std::map<int, std::vector<int>> gVehicleStationMap;
-bool IsNoRadioVehicle(int modelId);
+bool CanVehiclePlayAmbient(CVehicle* vehicle);
+int GetAmbientStationForVehicle(CVehicle* vehicle);
 
 // Declared in Main.cpp — maps the 0..127 radio-volume slider to BASS 0.0..1.0.
 float RadioVolume(unsigned int pref);
@@ -56,17 +61,21 @@ double StationTimelineMs(int index, bool applyStartOffset);
 
 // Ambient stream — only touched on main thread
 static HSTREAM gAmbientStream = 0;
-int gAmbientStation = -1;
-CVehicle* gAmbientVehicle = nullptr;
+static int gAmbientVehicleRef = -1;
 static float gAmbientLastVol = -1.0f;
 static DWORD gAmbientLastVolTick = 0;
+static float gAmbientLastPan = 0.0f;
 
 // Background loading
 // gAmbientBuf: protected by gAmbientMutex
 // gAmbientReadyStream: fully prepared stream, handed to main thread
 static std::mutex gAmbientMutex;
-static std::vector<BYTE> gAmbientBuf;
+static std::vector<BYTE> gAmbientReadyBuffer; // worker -> main handoff, under mutex
+static std::vector<BYTE> gAmbientActiveBuffer; // borrowed by BASS until StreamFree
 static HSTREAM gAmbientReadyStream = 0;
+static std::atomic<unsigned int> gAmbientGeneration{ 0 };
+static std::atomic<DWORD> gAmbientRetryAfter{ 0 };
+static bool gAmbientWasPaused = false;
 static std::atomic<bool> gAmbientStreamReady(false);
 static std::atomic<bool> gAmbientLoadingInProgress(false);
 static int gAmbientLoadingStation = -1;
@@ -79,19 +88,24 @@ static void StopAmbientStream()
         BASS_StreamFree(gAmbientStream);
         gAmbientStream = 0;
     }
-    // Also free any ready-but-unplayed stream
+    gAmbientActiveBuffer.clear(); // AFTER BASS_StreamFree
     {
         std::lock_guard<std::mutex> lock(gAmbientMutex);
+        gAmbientGeneration.fetch_add(1, std::memory_order_acq_rel);
+        gAmbientStreamReady.store(false, std::memory_order_release);
+        gAmbientLoadingInProgress.store(false, std::memory_order_release);
         if (gAmbientReadyStream) {
             BASS_StreamFree(gAmbientReadyStream);
             gAmbientReadyStream = 0;
         }
-        gAmbientBuf.clear();
+        gAmbientReadyBuffer.clear();
     }
-    gAmbientStation = -1;
-    gAmbientVehicle = nullptr;
+    gAmbientVehicleRef = -1;
+    gAmbientLoadingStation = -1;
     gAmbientLastVol = -1.0f;
-    gAmbientStreamReady = false;
+    gAmbientLastVolTick = 0;
+    gAmbientLastPan = 0.0f;
+    gAmbientWasPaused = false;
 }
 
 static bool IsADF(const std::string& path)
@@ -128,66 +142,65 @@ static float CalcVolume(float distance)
 }
 
 // Everything heavy runs here — file I/O, decoding, stream creation, FX setup
-static void AmbientLoadThread(int stationIndex)
+static void AmbientLoadThread(int stationIndex, unsigned int generation, double timelineSnapshot, DWORD startedAt)
 {
-    if (stationIndex < 0 || stationIndex >= (int)stations.size()) {
-        gAmbientLoadingInProgress = false;
-        return;
-    }
+    if (stationIndex < 0 || stationIndex >= (int)stations.size()) return;
+    auto fail = [&]() {
+        std::lock_guard<std::mutex> lock(gAmbientMutex);
+        if (gAmbientGeneration.load(std::memory_order_acquire) == generation) {
+            gAmbientLoadingInProgress.store(false, std::memory_order_release);
+            gAmbientRetryAfter.store(GetTickCount() + 2000, std::memory_order_release);
+        }
+    };
 
     std::string fullPath = gGameFolder + stations[stationIndex].file;
     HSTREAM stream = 0;
-
+    std::vector<BYTE> ownedAdfBuffer;
     if (IsADF(fullPath)) {
-        std::ifstream f(fullPath, std::ios::binary);
-        if (!f.is_open()) {
-            gLog << "Ambient: cannot open " << fullPath << std::endl;
-            gLog.flush();
-            gAmbientLoadingInProgress = false;
+        std::vector<BYTE> buf;
+        const auto cancelled = [generation]() {
+            return gAmbientGeneration.load(std::memory_order_acquire) != generation;
+        };
+        if (!LoadDecryptedAdf(fullPath, buf, cancelled)) {
+            if (!cancelled()) {
+                QueueRadioWorkerLog("Ambient: could not read/decrypt " + fullPath);
+                fail();
+            }
             return;
         }
-
-        std::vector<BYTE> buf;
-        buf.assign(
-            std::istreambuf_iterator<char>(f),
-            std::istreambuf_iterator<char>()
-        );
-        f.close();
-
-        for (size_t i = 0; i < buf.size(); i++)
-            buf[i] ^= 0x22;
-
         stream = BASS_StreamCreateFile(TRUE, buf.data(), 0,
             (QWORD)buf.size(), BASS_SAMPLE_LOOP);
 
         if (!stream) {
-            gLog << "Ambient: BASS error " << BASS_ErrorGetCode() << std::endl;
-            gLog.flush();
-            gAmbientLoadingInProgress = false;
+            QueueRadioWorkerLog("Ambient: BASS error " + std::to_string(BASS_ErrorGetCode()));
+            fail();
             return;
         }
 
-        // Keep buffer alive under lock
-        std::lock_guard<std::mutex> lock(gAmbientMutex);
-        gAmbientBuf = std::move(buf);
+        // Keep the worker's source memory alive until the ready handoff.
+        ownedAdfBuffer = std::move(buf);
     }
     else {
         stream = BASS_StreamCreateFile(FALSE, fullPath.c_str(), 0, 0,
             BASS_SAMPLE_LOOP);
 
         if (!stream) {
-            gLog << "Ambient: BASS error " << BASS_ErrorGetCode() << std::endl;
-            gLog.flush();
-            gAmbientLoadingInProgress = false;
+            QueueRadioWorkerLog("Ambient: BASS error " + std::to_string(BASS_ErrorGetCode()));
+            fail();
             return;
         }
     }
 
-    // Seek to gRadioTime
+    if (gAmbientGeneration.load(std::memory_order_acquire) != generation) {
+        BASS_StreamFree(stream);
+        return;
+    }
+    // Same station clock as the interior radio, compensating for load latency.
     QWORD totalBytes = BASS_ChannelGetLength(stream, BASS_POS_BYTE);
     double totalMs = BASS_ChannelBytes2Seconds(stream, totalBytes) * 1000.0;
     if (totalMs > 0.0) {
-        double seekMs = fmod(StationTimelineMs(stationIndex, false), totalMs);
+        double seekMs = fmod(timelineSnapshot + (DWORD)(GetTickCount() - startedAt), totalMs);
+        if (seekMs < 0.0) seekMs += totalMs;
         QWORD seekBytes = BASS_ChannelSeconds2Bytes(stream, seekMs / 1000.0);
         BASS_ChannelSetPosition(stream, seekBytes, BASS_POS_BYTE);
     }
@@ -196,17 +209,17 @@ static void AmbientLoadThread(int stationIndex)
     // These stay in bass.dll (no bass_fx add-on) and can be toggled in the INI.
     if (gAmbientRadioParamEq) {
         BASS_DX8_PARAMEQ eq;
-        eq.fBandwidth = 18.0f;
+        eq.fBandwidth = 1.6f;
 
         HFX hFx = BASS_ChannelSetFX(stream, BASS_FX_DX8_PARAMEQ, 1);
-        eq.fCenter = 800.0f;
-        eq.fGain = -18.0f;
-        BASS_FXSetParameters(hFx, &eq);
+        eq.fCenter = 180.0f;
+        eq.fGain = -5.0f;
+        if (hFx) BASS_FXSetParameters(hFx, &eq);
 
         HFX hFx2 = BASS_ChannelSetFX(stream, BASS_FX_DX8_PARAMEQ, 2);
-        eq.fCenter = 3500.0f;
-        eq.fGain = -28.0f;
-        BASS_FXSetParameters(hFx2, &eq);
+        eq.fCenter = 5500.0f;
+        eq.fGain = -8.0f;
+        if (hFx2) BASS_FXSetParameters(hFx2, &eq);
     }
 
     if (gAmbientRadioCompressor) {
@@ -214,11 +227,11 @@ static void AmbientLoadThread(int stationIndex)
         comp.fGain = 0.0f;
         comp.fAttack = 8.0f;
         comp.fRelease = 120.0f;
-        comp.fThreshold = -18.0f;
-        comp.fRatio = 3.0f;
+        comp.fThreshold = -14.0f;
+        comp.fRatio = 2.0f;
         comp.fPredelay = 4.0f;
         HFX hComp = BASS_ChannelSetFX(stream, BASS_FX_DX8_COMPRESSOR, 3);
-        BASS_FXSetParameters(hComp, &comp);
+        if (hComp) BASS_FXSetParameters(hComp, &comp);
     }
 
     if (gAmbientRadioReverb) {
@@ -228,180 +241,220 @@ static void AmbientLoadThread(int stationIndex)
         rev.fReverbTime = 450.0f;
         rev.fHighFreqRTRatio = 0.25f;
         HFX hRev = BASS_ChannelSetFX(stream, BASS_FX_DX8_REVERB, 4);
-        BASS_FXSetParameters(hRev, &rev);
+        if (hRev) BASS_FXSetParameters(hRev, &rev);
     }
 
-    // Hand the ready stream to the main thread
+    // Publish the stream and its borrowed memory as a single ownership transfer.
+    // An obsolete worker frees only its own stream, never the active one.
     {
         std::lock_guard<std::mutex> lock(gAmbientMutex);
+        if (gAmbientGeneration.load(std::memory_order_acquire) != generation) {
+            BASS_StreamFree(stream);
+            return;
+        }
+        gAmbientReadyBuffer = std::move(ownedAdfBuffer);
         gAmbientReadyStream = stream;
+        gAmbientStreamReady.store(true, std::memory_order_release);
+        gAmbientLoadingInProgress.store(false, std::memory_order_release);
     }
-
-    gLog << "Ambient: ready [" << stations[stationIndex].name << "]" << std::endl;
-    gLog.flush();
-
-    gAmbientStreamReady = true;
-    gAmbientLoadingInProgress = false;
 }
 
-static void StartAmbientLoad(int stationIndex, CVehicle* pVehicle)
+static void StartAmbientLoad(int stationIndex, int vehicleRef)
 {
-    if (gAmbientLoadingInProgress) return;
+    if (stationIndex < 0 || stationIndex >= (int)stations.size()) return;
+    if (gAmbientLoadingInProgress.load(std::memory_order_acquire)) return;
+    DWORD retryAfter = gAmbientRetryAfter.load(std::memory_order_acquire);
+    if (retryAfter && (LONG)(GetTickCount() - retryAfter) < 0)
+        return;
 
     StopAmbientStream();
-    gAmbientLoadingStation = stationIndex;
-    gAmbientVehicle = pVehicle;
-    gAmbientLoadingInProgress = true;
-    gAmbientStreamReady = false;
-
-    std::thread(AmbientLoadThread, stationIndex).detach();
+    unsigned int gen;
+    {
+        std::lock_guard<std::mutex> lock(gAmbientMutex);
+        gen = gAmbientGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+        gAmbientLoadingStation = stationIndex;
+        gAmbientVehicleRef = vehicleRef;
+        gAmbientLoadingInProgress.store(true, std::memory_order_release);
+    }
+    const double timeline = StationTimelineMs(stationIndex, false);
+    std::thread(AmbientLoadThread, stationIndex, gen, timeline, GetTickCount()).detach();
 }
 
 extern bool gAmbientRadioEnabled;
+
+static int sCachedVehicleRef = -1;
+static DWORD sScanTick = 0;
+static int sRetryVehicleRef = -1;
+static bool sHasScanned = false;
+static bool HasAmbientWork()
+{
+    return gAmbientStream || gAmbientVehicleRef >= 0 ||
+        gAmbientLoadingInProgress.load(std::memory_order_acquire) ||
+        gAmbientStreamReady.load(std::memory_order_acquire);
+}
+static void ResetAmbient()
+{
+    if (HasAmbientWork()) StopAmbientStream();
+    sCachedVehicleRef = -1;
+    sHasScanned = false;
+    sRetryVehicleRef = -1;
+    gAmbientRetryAfter.store(0, std::memory_order_release);
+}
+
+static CVehicle* ResolveAmbientVehicle(int handle, CVehicle* playerVehicle, CPlayerPed* player)
+{
+    if (handle < 0 || !CPools::ms_pVehiclePool) return nullptr;
+    CVehicle* vehicle = CPools::GetVehicle(handle);
+    return vehicle && vehicle != playerVehicle && vehicle->m_pDriver &&
+        vehicle->m_pDriver != player && CanVehiclePlayAmbient(vehicle) ? vehicle : nullptr;
+}
+
+static void ProcessAmbientRadio()
+{
+    CPlayerPed* player = FindPlayerPed();
+    if (!gAmbientRadioEnabled || !gBassReady || !player ||
+        !CPools::ms_pVehiclePool || FrontEndMenuManager.m_bWantToLoad ||
+        FrontEndMenuManager.m_bWantToRestart) {
+        ResetAmbient();
+        return;
+    }
+
+    const bool seated = IsRadioSeated(player);
+    // Exiting is not a new ambient source: the game keeps the departing
+    // player in the driver's seat until the door/animation callback.
+    if (!seated && player->m_bInVehicle && player->m_pVehicle) {
+        ResetAmbient();
+        return;
+    }
+    CVehicle* ownVehicle = seated ? player->m_pVehicle : nullptr;
+    // An entry can complete between two scans: stop the exterior source now,
+    // without erasing its persistent station assignment.
+    if (gAmbientVehicleRef >= 0 && !ResolveAmbientVehicle(gAmbientVehicleRef, ownVehicle, player))
+        StopAmbientStream();
+
+    if (FrontEndMenuManager.m_bMenuActive || CCutsceneMgr::ms_running || TheCamera.m_bWideScreenOn) {
+        if (gAmbientStream && !gAmbientWasPaused) {
+            BASS_ChannelPause(gAmbientStream);
+            gAmbientWasPaused = true;
+        }
+        return;
+    }
+
+    const CVector playerPos = player->GetPosition();
+    const float rangeSq = gAmbientRadioDistance * gAmbientRadioDistance;
+    DWORD now = GetTickCount();
+    CVehicle* closest = ResolveAmbientVehicle(sCachedVehicleRef, ownVehicle, player);
+    float closestSq = closest ? DistanceSq(playerPos, closest->GetPosition()) : rangeSq;
+    if (closestSq >= rangeSq) { closest = nullptr; sCachedVehicleRef = -1; }
+    // Re-scan at 10Hz; check the cached vehicle's live position each frame to
+    // stop stale sounds immediately. A small hysteresis avoids repeated
+    // decoder restarts at a busy intersection with equally distant cars.
+    if (!sHasScanned || now - sScanTick >= 100 ||
+        (sCachedVehicleRef >= 0 && !closest)) {
+        sHasScanned = true; sScanTick = now;
+        const float switchThreshold = closest ? closestSq * 0.81f : rangeSq;
+        CVehicle* next = nullptr;
+        float nextSq = switchThreshold;
+        for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; ++i) {
+            if (CPools::ms_pVehiclePool->IsFreeSlotAtIndex(i)) continue;
+            CVehicle* vehicle = CPools::ms_pVehiclePool->GetAt(i);
+            if (!vehicle || vehicle == ownVehicle || !vehicle->m_pDriver || vehicle->m_pDriver == player) continue;
+            float dist = DistanceSq(playerPos, vehicle->GetPosition());
+            if (dist >= nextSq || !CanVehiclePlayAmbient(vehicle)) continue;
+            next = vehicle; nextSq = dist;
+        }
+        if (next) { closest = next; closestSq = nextSq; }
+        sCachedVehicleRef = closest ? CPools::GetVehicleRef(closest) : -1;
+    }
+    if (!closest || GetMusicVolume() == 0 || gAmbientRadioVolume <= 0.0f ||
+        (seated && gAmbientRadioInCarVolume <= 0.0f)) {
+        if (HasAmbientWork()) StopAmbientStream();
+        return;
+    }
+
+    const int station = GetAmbientStationForVehicle(closest);
+    if (station < 0) {
+        if (HasAmbientWork()) StopAmbientStream();
+        sCachedVehicleRef = -1;
+        return;
+    }
+    if (gAmbientVehicleRef != sCachedVehicleRef || gAmbientLoadingStation != station) {
+        if (HasAmbientWork()) StopAmbientStream(); // invalidate old ready or loading source
+        if (sRetryVehicleRef != sCachedVehicleRef) {
+            sRetryVehicleRef = sCachedVehicleRef;
+            gAmbientRetryAfter.store(0, std::memory_order_release);
+        }
+        StartAmbientLoad(station, sCachedVehicleRef);
+        return;
+    }
+
+    const float distance = sqrtf(closestSq);
+    const float volume = CalcVolume(distance) * gAmbientRadioVolume *
+        (seated ? gAmbientRadioInCarVolume : 1.0f) * RadioVolume(GetMusicVolume());
+    const CVector vehPos = closest->GetPosition();
+    const CVector right = player->GetRight();
+    const float dx = vehPos.x - playerPos.x, dy = vehPos.y - playerPos.y;
+    const float planar = sqrtf(dx * dx + dy * dy);
+    float pan = planar > 0.1f ? (dx * right.x + dy * right.y) / planar * 0.55f : 0.0f;
+    pan = (std::max)(-0.55f, (std::min)(0.55f, pan));
+
+    if (gAmbientStreamReady.load(std::memory_order_acquire) && !gAmbientStream) {
+        {
+            std::lock_guard<std::mutex> lock(gAmbientMutex);
+            gAmbientStreamReady.store(false, std::memory_order_release);
+            gAmbientStream = gAmbientReadyStream;
+            gAmbientReadyStream = 0;
+            gAmbientActiveBuffer = std::move(gAmbientReadyBuffer);
+        }
+        if (!gAmbientStream) return;
+        BASS_ChannelSetAttribute(gAmbientStream, BASS_ATTRIB_VOL, volume);
+        BASS_ChannelSetAttribute(gAmbientStream, BASS_ATTRIB_PAN, pan);
+        if (!BASS_ChannelPlay(gAmbientStream, FALSE)) {
+            StopAmbientStream();
+            gAmbientRetryAfter.store(GetTickCount() + 2000, std::memory_order_release);
+            return;
+        }
+        gAmbientLastVol = volume; gAmbientLastPan = pan;
+        gAmbientWasPaused = false; gAmbientLastVolTick = now;
+        gLog << "Ambient: vehicle ref " << sCachedVehicleRef << " playing ["
+            << stations[station].name << "]" << std::endl;
+        return;
+    }
+
+    if (gAmbientStream) {
+        if (gAmbientWasPaused) {
+            BASS_ChannelPlay(gAmbientStream, FALSE);
+            gAmbientWasPaused = false;
+        } else if (BASS_ChannelIsActive(gAmbientStream) == BASS_ACTIVE_STOPPED) {
+            StopAmbientStream();
+            gAmbientRetryAfter.store(now + 2000, std::memory_order_release);
+            return;
+        }
+        if (now - gAmbientLastVolTick >= 100) {
+            gAmbientLastVolTick = now;
+            float smooth = gAmbientLastVol + (volume - gAmbientLastVol) * 0.4f;
+            if (volume == 0.0f || fabsf(smooth - gAmbientLastVol) > 0.002f) {
+                if (volume == 0.0f) smooth = 0.0f;
+                BASS_ChannelSetAttribute(gAmbientStream, BASS_ATTRIB_VOL, smooth);
+                gAmbientLastVol = smooth;
+            }
+            if (fabsf(pan - gAmbientLastPan) > 0.015f) {
+                BASS_ChannelSetAttribute(gAmbientStream, BASS_ATTRIB_PAN, pan);
+                gAmbientLastPan = pan;
+            }
+        }
+        return;
+    }
+    if (!gAmbientLoadingInProgress.load(std::memory_order_acquire))
+        StartAmbientLoad(station, sCachedVehicleRef);
+}
 
 class AmbientCarPlugin
 {
 public:
     AmbientCarPlugin()
     {
-        Events::gameProcessEvent.Add([]()
-            {
-                if (!gAmbientRadioEnabled || !gBassReady) return;
-                CPlayerPed* pPlayer = FindPlayerPed();
-                if (!pPlayer) {
-                    StopAmbientStream();
-                    return;
-                }
-
-                if (FrontEndMenuManager.m_bMenuActive) {
-                    if (gAmbientStream) BASS_ChannelPause(gAmbientStream);
-                    return;
-                }
-                else if (gAmbientStream) {
-                    BASS_ChannelPlay(gAmbientStream, FALSE);
-                }
-
-                CVehicle* playerVehicle = pPlayer->m_pVehicle;
-                CVector playerPos = pPlayer->GetPosition();
-
-                // Scan vehicle pool at most every 100ms
-                static CVehicle* sCachedVehicle = nullptr;
-                static int sCachedStation = -1;
-                static float sCachedDistSq = 9999.0f;
-                static DWORD sScanTick = 0;
-
-                DWORD nowScan = GetTickCount();
-                if (nowScan - sScanTick >= 100) {
-                    sScanTick = nowScan;
-
-                    CVehicle* newVehicle = nullptr;
-                    int newStation = -1;
-                    float newDistSq = gAmbientRadioDistance * gAmbientRadioDistance;
-
-                    for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
-                        if (CPools::ms_pVehiclePool->IsFreeSlotAtIndex(i)) continue;
-                        CVehicle* pVeh = CPools::ms_pVehiclePool->GetAt(i);
-                        if (!pVeh) continue;
-                        if (pVeh == playerVehicle) continue; // do not play the player's own car as exterior ambient
-
-                        int modelId = pVeh->m_nModelIndex;
-                        if (IsNoRadioVehicle(modelId)) continue;  // [NORADIO]: no ambient either
-                        if (stations.empty()) continue;
-
-                        // Only play if someone is in the car
-                        if (!pVeh->m_pDriver) continue;
-
-                        auto it = gVehicleStationMap.find(modelId);
-
-                        CVector vehPos = pVeh->GetPosition();
-                        float distSq = DistanceSq(playerPos, vehPos);
-
-                        if (distSq < newDistSq) {
-                            newDistSq = distSq;
-                            newVehicle = pVeh;
-                            if (newVehicle != sCachedVehicle) {
-                                if (it != gVehicleStationMap.end() && !it->second.empty()) {
-                                    const std::vector<int>& options = it->second;
-                                    newStation = options[rand() % options.size()];
-                                }
-                                else {
-                                    int count = (int)stations.size();
-                                    if (count > 0 && stations[count - 1].name == "MP3 PLAYER")
-                                        count--;
-                                    newStation = (count > 0) ? (rand() % count) : -1;
-                                }
-                            }
-                            else {
-                                newStation = sCachedStation;
-                            }
-                        }
-                    }
-
-                    sCachedDistSq = newDistSq;
-                    if (newVehicle != sCachedVehicle) {
-                        sCachedVehicle = newVehicle;
-                        sCachedStation = newStation;
-                    }
-                }
-
-                CVehicle* closestVehicle = sCachedVehicle;
-                int closestStation = sCachedStation;
-                float closestDistSq = sCachedDistSq;
-
-                if (!closestVehicle) {
-                    StopAmbientStream();
-                    return;
-                }
-
-                float distance = sqrtf(closestDistSq);
-                float volume = CalcVolume(distance) * gAmbientRadioVolume;
-                if (gPlayerInVehicle)
-                    volume *= gAmbientRadioInCarVolume; // heard through the player's car shell
-                float gameVol = RadioVolume(GetMusicVolume());
-
-                // Stream fully prepared in background — just play it
-                if (gAmbientStreamReady && !gAmbientStream) {
-                    gAmbientStreamReady = false;
-                    {
-                        std::lock_guard<std::mutex> lock(gAmbientMutex);
-                        gAmbientStream = gAmbientReadyStream;
-                        gAmbientReadyStream = 0;
-                    }
-                    gAmbientStation = gAmbientLoadingStation;
-                    float vol = volume * gameVol;
-                    BASS_ChannelSetAttribute(gAmbientStream, BASS_ATTRIB_VOL, vol);
-                    BASS_ChannelPlay(gAmbientStream, FALSE);
-                    gAmbientLastVol = vol;
-                    gLog << "Ambient: playing [" << stations[gAmbientStation].name << "]" << std::endl;
-                    gLog.flush();
-                    return;
-                }
-
-                // Stream playing — update volume or reload if vehicle changed
-                if (gAmbientStream) {
-                    if (closestVehicle != gAmbientVehicle || closestStation != gAmbientStation) {
-                        if (distance < gAmbientRadioDistance && !gAmbientLoadingInProgress)
-                            StartAmbientLoad(closestStation, closestVehicle);
-                    }
-                    else {
-                        DWORD now = GetTickCount();
-                        if (now - gAmbientLastVolTick >= 100) {
-                            gAmbientLastVolTick = now;
-                            float newVol = volume * gameVol;
-                            if (fabsf(newVol - gAmbientLastVol) > 0.005f) {
-                                BASS_ChannelSetAttribute(gAmbientStream, BASS_ATTRIB_VOL, newVol);
-                                gAmbientLastVol = newVol;
-                            }
-                        }
-                    }
-                    return;
-                }
-
-                // Nothing playing, nothing loading — start anywhere inside audible range.
-                // The previous VC threshold only started in a narrow far-away band,
-                // so nearby NPC cars never began ambient playback.
-                if (!gAmbientLoadingInProgress && distance < gAmbientRadioDistance)
-                    StartAmbientLoad(closestStation, closestVehicle);
-            });
+        Events::initGameEvent.Add([]() { ResetAmbient(); });
+        Events::gameProcessEvent.Add([]() { ProcessAmbientRadio(); });
     }
 } ambientCarPlugin;
