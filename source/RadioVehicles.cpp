@@ -1,6 +1,7 @@
 #include "plugin.h"
 #include "CPlayerPed.h"
 #include "CVehicle.h"
+#include "CPools.h"
 #include <fstream>
 #include <string>
 #include <vector>
@@ -32,12 +33,11 @@ static int gLastStation = -1;
 // and the station does NOT carry over from the previous vehicle.
 static bool gRadioAutoTune = false;
 
-// Per-vehicle saved station — keyed by vehicle pointer (unique per instance).
-// We also remember the model id, so if VC's vehicle pool later reuses this exact
-// pointer for a DIFFERENT model, we discard the stale entry instead of playing
-// the previous vehicle's station in a fresh car.
+// The game's pool handle includes the slot generation, unlike a raw pointer.
+// Recycled vehicles of the SAME model must not inherit a previous vehicle's
+// station simply because the pool reused the same address.
 struct SavedStation { int station; int modelId; };
-static std::map<CVehicle*, SavedStation> gVehicleSavedStation;
+static std::map<int, SavedStation> gVehicleSavedStation;
 
 // Vehicle model ID -> list of station indices (pick randomly if multiple)
 std::map<int, std::vector<int>> gVehicleStationMap;
@@ -68,6 +68,11 @@ static void LoadVehicleSection()
         gLog.flush();
         return;
     }
+
+    gVehicleSavedStation.clear();
+    gVehicleStationMap.clear();
+    gNoRadioVehicles.clear();
+    gLastStation = -1;
 
     auto trim = [](std::string& s) {
         size_t start = s.find_first_not_of(" \t\r\n");
@@ -185,16 +190,26 @@ int GetStationForVehicle(CVehicle* pVehicle)
     // if the model still matches (guards against the pool reusing this pointer for
     // a different model). This is what makes a bike/car keep its station no matter
     // how long the player is away, like stock VC.
-    auto saved = gVehicleSavedStation.find(pVehicle);
+    const int vehicleHandle = CPools::GetVehicleRef(pVehicle);
+    auto saved = gVehicleSavedStation.find(vehicleHandle);
     if (saved != gVehicleSavedStation.end()) {
-        if (saved->second.modelId == pVehicle->m_nModelIndex) {
+        if (saved->second.modelId == pVehicle->m_nModelIndex &&
+            saved->second.station >= 0 && saved->second.station < (int)stations.size()) {
             int station = saved->second.station;
             gLog << "RadioVehicles: resuming saved station [" << stations[station].name << "] for this vehicle" << std::endl;
             gLog.flush();
             return station;
         }
-        gVehicleSavedStation.erase(saved); // stale pointer reused by a different model
+        gVehicleSavedStation.erase(saved);
     }
+
+    // The player heard this vehicle's NPC radio outside: use the same station
+    // inside, even if this vehicle model had no explicit [VEHICLES] mapping.
+    extern CVehicle* gAmbientVehicle;
+    extern int gAmbientStation;
+    if (gAmbientVehicle == pVehicle && gAmbientStation >= 0 &&
+        gAmbientStation < (int)stations.size())
+        return gAmbientStation;
 
     // (No time-based carry-over: a DIFFERENT/new vehicle gets its own station — its
     // [VEHICLES] assignment or a random pick — unless RadioAutoTune is on, above.)
@@ -205,16 +220,7 @@ int GetStationForVehicle(CVehicle* pVehicle)
     if (it != gVehicleStationMap.end()) {
         const std::vector<int>& options = it->second;
 
-        // If ambient was already playing a station for this vehicle, use that
-        // to stay in sync with what the player heard outside
-        extern CVehicle* gAmbientVehicle;
-        extern int gAmbientStation;
-        if (gAmbientVehicle == pVehicle && gAmbientStation >= 0) {
-            gLog << "RadioVehicles: syncing to ambient station [" << stations[gAmbientStation].name << "]" << std::endl;
-            gLog.flush();
-            return gAmbientStation;
-        }
-
+        if (options.empty()) return 0;
         int pick = options[rand() % options.size()];
         gLog << "RadioVehicles: model " << modelId << " -> [" << stations[pick].name << "]" << std::endl;
         gLog.flush();
@@ -225,6 +231,7 @@ int GetStationForVehicle(CVehicle* pVehicle)
     if (!stations.empty()) {
         int count = (int)stations.size();
         if (count > 0 && stations[count - 1].name == "MP3 PLAYER") count--;
+        if (count == 0) return (int)stations.size() - 1; // MP3-only config
         int pick = rand() % count;
         gLog << "RadioVehicles: model " << modelId << " not mapped, random -> [" << stations[pick].name << "]" << std::endl;
         gLog.flush();
@@ -240,7 +247,14 @@ void OnPlayerExitVehicle(CVehicle* pVehicle)
     // the SAME vehicle later resumes it regardless of how long we were away.
     int station = gCurrentStation != -1 ? gCurrentStation : gPendingStation;
     if (pVehicle && station >= 0 && station < (int)stations.size()) {
-        gVehicleSavedStation[pVehicle] = { station, pVehicle->m_nModelIndex };
+        int vehicleHandle = CPools::GetVehicleRef(pVehicle);
+        gVehicleSavedStation[vehicleHandle] = { station, pVehicle->m_nModelIndex };
+        if (gVehicleSavedStation.size() > 256) {
+            for (auto it = gVehicleSavedStation.begin(); it != gVehicleSavedStation.end();) {
+                if (!CPools::GetVehicle(it->first)) it = gVehicleSavedStation.erase(it);
+                else ++it;
+            }
+        }
         gLog << "RadioVehicles: saved [" << stations[station].name << "] to vehicle instance" << std::endl;
     }
 
