@@ -208,7 +208,9 @@ static double gMp3TotalDuration = 0.0;
 
 // Background loading — gLoadedBuffer protected by gLoadMutex
 static std::mutex gLoadMutex;
-static std::vector<BYTE> gLoadedBuffer;
+static std::vector<BYTE> gLoadedBuffer;  // producer staging only; never passed to BASS
+static std::vector<BYTE> gActiveStreamBuffer; // BASS uses this memory until StreamFree
+static std::atomic<unsigned int> gLoadGeneration{ 0 }; // invalidates outdated detached workers
 static std::atomic<bool> gBufferReady(false);
 static std::atomic<bool> gLoadingInProgress(false);
 static int gLoadingStation = -1;
@@ -246,6 +248,7 @@ static HSTREAM gSfxStaticStream = 0;
 static bool gSfxLoaded = false;
 static bool gSfxLoadAttempted = false;
 static bool gInitialStationQueued = false;
+static bool gRadioSwitchSfx = false; // legacy GTA:VC bank offsets are not GTA III sample IDs
 
 // SDT entry structure — GTA VC PC: 20 bytes each
 struct SdtEntry {
@@ -415,6 +418,18 @@ static void StopStaticSound()
     }
 }
 
+// Invalidate outstanding background loads before clearing their staging buffer.
+// Workers only publish results when their captured generation still matches.
+static void CancelPendingStationLoad()
+{
+    gLoadGeneration.fetch_add(1, std::memory_order_acq_rel);
+    gLoadingInProgress.store(false, std::memory_order_release);
+    gBufferReady.store(false, std::memory_order_release);
+    gWaitingToPlay = false;
+    std::lock_guard<std::mutex> lock(gLoadMutex);
+    gLoadedBuffer.clear();
+}
+
 static void TurnRadioOff()
 {
     if (gStream) {
@@ -422,12 +437,9 @@ static void TurnRadioOff()
         BASS_StreamFree(gStream);
         gStream = 0;
     }
+    gActiveStreamBuffer.clear();
     StopStaticSound();
-    {
-        std::lock_guard<std::mutex> lock(gLoadMutex);
-        gLoadedBuffer.clear();
-    }
-    gBufferReady = false;
+    CancelPendingStationLoad();
     gCurrentStation = -1;
     gWaitingToPlay = false;
     gStationNameToShow = "Radio Off";
@@ -443,6 +455,8 @@ static void StopRadio()
         BASS_StreamFree(gStream);
         gStream = 0;
     }
+    // BASS_StreamCreateFile(mem=TRUE) borrows our pointer: free data AFTER StreamFree.
+    gActiveStreamBuffer.clear();
 }
 
 // Fully tear down the radio and reset all per-session state. Used when the game
@@ -453,13 +467,10 @@ static void StopAndResetRadio()
 {
     StopRadio();
     StopStaticSound();
-    {
-        std::lock_guard<std::mutex> lock(gLoadMutex);
-        gLoadedBuffer.clear();
-    }
-    gBufferReady = false;
-    gWaitingToPlay = false;
+    CancelPendingStationLoad();
     gWasInVehicle = false;
+    gPlayerInVehicle = false;
+    gActiveVehicle = nullptr;
     gCurrentStation = -1;
     gPendingStation = -1;
     gInitialStationQueued = false;
@@ -480,13 +491,10 @@ static void ForceNativeRadioOff(CVehicle* pVehicle)
     gMusicManager.m_nRadioInCar = 10;
     gMusicManager.m_nRadioStation = 10;
     gMusicManager.m_bRadioSetByScript = false;
-    gMusicManager.m_bDoTrackService = false;
 
-    // GTA III's cMusicManager::ServiceTrack starts the native radio on streamed
-    // channel 0 when m_bDoTrackService is set. Stop that channel while the player
-    // is in a vehicle so the game's default radio cannot play underneath BASS.
-    plugin::CallMethod<0x5680E0, cSampleManager*, unsigned char>(&SampleManager, 0);
-
+    // NEVER StopStreamedFile(0) here. GTA III shares that channel with mission
+    // passed music, bridge announcements, scripted cutscenes and ambience.
+    // Repeatedly stopping it caused those native sounds to fail in vehicles.
     if (pVehicle)
         pVehicle->m_nRadioStation = 10;
 }
@@ -602,28 +610,29 @@ static void GetMp3PlayerPosition(double radioTime, int& fileIndex, double& seekM
     seekMs = 0;
 }
 
-static void LoadStationThread(int index)
+static void LoadStationThread(int index, unsigned int generation, double timelineSnapshot)
 {
+    if (index < 0 || index >= (int)stations.size())
+        return;
     if (index == gMp3StationIndex) {
+        if (gMp3Files.empty()) return;
         int fileIndex;
         double seekMs;
-        GetMp3PlayerPosition(gRadioTime, fileIndex, seekMs);
+        GetMp3PlayerPosition(timelineSnapshot, fileIndex, seekMs);
 
+        if (gLoadGeneration.load(std::memory_order_acquire) != generation) return;
         {
             std::lock_guard<std::mutex> lock(gMp3Mutex);
             gMp3FilePath = gMp3Files[fileIndex];
             gMp3SeekMs = seekMs;
         }
-
-        gLog << "Thread: MP3 PLAYER -> " << gMp3Files[fileIndex] << " at " << (DWORD)seekMs << " ms" << std::endl;
-        gLog.flush();
-
         {
             std::lock_guard<std::mutex> lock(gLoadMutex);
+            if (gLoadGeneration.load(std::memory_order_acquire) != generation) return;
             gLoadedBuffer.clear();
+            gBufferReady.store(true, std::memory_order_release);
+            gLoadingInProgress.store(false, std::memory_order_release);
         }
-        gBufferReady = true;
-        gLoadingInProgress = false;
         return;
     }
 
@@ -639,7 +648,10 @@ static void LoadStationThread(int index)
         if (!f.is_open()) {
             gLog << "Thread: cannot open file!" << std::endl;
             gLog.flush();
-            gLoadingInProgress = false;
+            if (gLoadGeneration.load(std::memory_order_acquire) == generation) {
+                gLoadingInProgress.store(false, std::memory_order_release);
+                gBufferReady.store(true, std::memory_order_release); // playback reports missing ADF
+            }
             return;
         }
 
@@ -657,22 +669,24 @@ static void LoadStationThread(int index)
 
     {
         std::lock_guard<std::mutex> lock(gLoadMutex);
+        if (gLoadGeneration.load(std::memory_order_acquire) != generation) return;
         gLoadedBuffer = std::move(buf);
+        gBufferReady.store(true, std::memory_order_release);
+        gLoadingInProgress.store(false, std::memory_order_release);
     }
-    gBufferReady = true;
-    gLoadingInProgress = false;
 }
 
 static void StartLoadingStation(int index)
 {
-    if (gLoadingInProgress)
-        return;
-
-    gBufferReady = false;
-    gLoadingInProgress = true;
+    if (index < 0 || index >= (int)stations.size()) return;
+    // Latest requested station wins. Stale workers cannot publish or overwrite
+    // the buffer for a newer request, even if their I/O completes afterward.
+    unsigned int generation = gLoadGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    gBufferReady.store(false, std::memory_order_release);
+    gLoadingInProgress.store(true, std::memory_order_release);
     gLoadingStation = index;
     gWaitingToPlay = true;
-    std::thread(LoadStationThread, index).detach();
+    std::thread(LoadStationThread, index, generation, gRadioTime).detach();
 }
 
 static void PlayLoadedStation(int index)
@@ -701,23 +715,20 @@ static void PlayLoadedStation(int index)
         gLog.flush();
     }
     else {
-        std::vector<BYTE> localBuffer;
         {
             std::lock_guard<std::mutex> lock(gLoadMutex);
-            localBuffer = std::move(gLoadedBuffer);
+            gActiveStreamBuffer = std::move(gLoadedBuffer);
             gLoadedBuffer.clear();
         }
 
-        if (!localBuffer.empty()) {
-            gStream = BASS_StreamCreateFile(TRUE, localBuffer.data(), 0, localBuffer.size(), BASS_SAMPLE_LOOP);
+        if (!gActiveStreamBuffer.empty()) {
+            gStream = BASS_StreamCreateFile(TRUE, gActiveStreamBuffer.data(), 0,
+                (QWORD)gActiveStreamBuffer.size(), BASS_SAMPLE_LOOP);
             if (!gStream) {
                 gLog << "BASS error: " << BASS_ErrorGetCode() << std::endl;
                 gLog.flush();
+                gActiveStreamBuffer.clear();
                 return;
-            }
-            {
-                std::lock_guard<std::mutex> lock(gLoadMutex);
-                gLoadedBuffer = std::move(localBuffer);
             }
         }
         else {
@@ -762,9 +773,11 @@ static void PlayLoadedStation(int index)
 
 static bool GenerateDefaultINI(const std::string& iniPath)
 {
-    std::ofstream out(iniPath, std::ios::out | std::ios::trunc);
-    if (!out.is_open())
+    HANDLE iniHandle = CreateFileA(iniPath.c_str(), GENERIC_WRITE, 0, nullptr,
+        CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr); // cannot replace an existing INI
+    if (iniHandle == INVALID_HANDLE_VALUE)
         return false;
+    std::ostringstream out;
 
     out << "# III.AmbientRadio autogenerated default configuration.\n";
     out << "# This file is created only when missing; existing configs are never overwritten.\n";
@@ -783,7 +796,8 @@ static bool GenerateDefaultINI(const std::string& iniPath)
     out << "RadioIconHud=0\n";
     out << "RadioIconScale=0.10\n";
     out << "RadioIconY=0.05\n";
-    out << "ScriptIntegration=1\n\n";
+    out << "ScriptIntegration=1\n";
+    out << "RadioSwitchSfx=0\n\n";
 
     out << "[CONTROLS]\n";
     out << "# Virtual-key code; 82 is R. Hold for ~2.5 seconds to turn radio off.\n";
@@ -816,8 +830,11 @@ static bool GenerateDefaultINI(const std::string& iniPath)
     out << "[STATIONICONS]\n";
     out << "# Optional icon mapping: Station Name | textureName (loads RadioHud\\textureName.png)\n";
     out << "# HEAD RADIO | head\n";
-
-    return true;
+    std::string contents = out.str();
+    DWORD written = 0;
+    BOOL ok = WriteFile(iniHandle, contents.data(), (DWORD)contents.size(), &written, nullptr);
+    CloseHandle(iniHandle);
+    return ok && written == contents.size();
 }
 
 static void LoadINI()
@@ -831,9 +848,12 @@ static void LoadINI()
     gScriptsFolder = std::string(path);
     gScriptsFolder = gScriptsFolder.substr(0, gScriptsFolder.find_last_of("\\/") + 1);
 
-    std::string noSlash = gScriptsFolder.substr(0, gScriptsFolder.size() - 1);
-    std::string parentFolder = noSlash.substr(0, noSlash.find_last_of("\\/") + 1);
-    gGameFolder = FileExists(gScriptsFolder + "audio\\SFX.SDT") ? gScriptsFolder : parentFolder;
+    // ModLoader installations can nest ASIs multiple directories deep.
+    // Asset paths must resolve relative to gta3.exe, not the ASI's parent folder.
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    gGameFolder = std::string(exePath);
+    gGameFolder = gGameFolder.substr(0, gGameFolder.find_last_of("\\/") + 1);
 
     std::string iniPath = gScriptsFolder + "III.AmbientRadio.ini";
     std::string logPath = gScriptsFolder + "III.AmbientRadio.log";
@@ -972,6 +992,8 @@ static void LoadINI()
                     gAmbientRadioCompressor = (atoi(val.c_str()) != 0);
                 else if (key == "ambientradioreverb")
                     gAmbientRadioReverb = (atoi(val.c_str()) != 0);
+                else if (key == "radioswitchsfx")
+                    gRadioSwitchSfx = (atoi(val.c_str()) != 0);
             }
             continue;
         }
@@ -1076,13 +1098,10 @@ static bool EnsureBassReady()
     if (!gBassReady)
         return false;
 
-    if (!gSfxLoaded && !gSfxLoadAttempted)
+    // The old bootstrap loaded and displayed station zero while on foot.
+    // Defer all radio loads until an actual vehicle-enter transition.
+    if (gRadioSwitchSfx && !gSfxLoaded && !gSfxLoadAttempted)
         LoadAllSfx();
-
-    if (!gInitialStationQueued && !stations.empty()) {
-        StartLoadingStation(0);
-        gInitialStationQueued = true;
-    }
 
     return true;
 }
