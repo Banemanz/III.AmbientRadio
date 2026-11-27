@@ -48,3 +48,13 @@ BASS external library licenses apply.
 - Check native radio suppression coexistence with original mission announcements (the native fallback may still require game-specific behaviour with music mode). Verify no simultaneous native radio + BASS.
 - Consider improving station seeking and per-station audio caching without introducing unbounded RAM.
 - Monitor `III.AmbientRadio.log` for BASS failures and async transitions.
+
+## Late-pass improvements and caveats (2026-11-26)
+
+- Player station `CancelPendingStationLoad` and `StartLoadingStation` now increment request generations **under the same mutex** used by workers to publish buffers. Previous implementation could pass the generation check just before cancellation and publish stale audio. Large ADF decrypt loops check for cancellation every 1 MiB.
+- The original GTA III PC streamed-name table in re3 lists `AUDIO\\COMOPEN.WAV` and `AUDIO\\SUBOPEN.WAV`; bridge lookup now supports stock WAV plus MP3 overrides.
+- Background workers now call `QueueRadioWorkerLog`, with the queue drained from the main gameProcessEvent; avoids concurrent unsynchronized writes to shared `std::ofstream`.
+- Idle ambient loop avoids calling StopAmbientStream on every frame; retry logic checks nonzero deadline and signed timer difference so early uptime does not freeze retries.
+- MP3 durations are read once and cached with std::call_once; NPC vehicle saved-station map uses `CPools::GetVehicleRef` handles and prunes dead slots.
+- CI builds already succeeded for earlier commits, but **check the latest PR-head Actions run before claiming final revision is build-verified**. A green CI build is still not gameplay verification.
+- Review: the native announcement fallback without a matching file may be suppressed when the native radio is off, and in-law-enforcement-car playback has not been runtime tested. Do not call bridge implementation fully proven until actual game testing.
