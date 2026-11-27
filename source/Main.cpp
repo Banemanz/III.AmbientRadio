@@ -1401,9 +1401,12 @@ public:
                 else if (gQueuedAnnouncement != -1 && gWasInVehicle && inVehicle) {
                     int ann = gQueuedAnnouncement;
                     gQueuedAnnouncement = -1;
-                    // GTA III's two bridge tracks are COMOPEN and SUBOPEN,
-                    // not Vice City's BOPEN/BCLOSED naming convention.
-                    std::string annFile = gGameFolder + "audio\\" + (ann == 0 ? "COMOPEN.MP3" : "SUBOPEN.MP3");
+                    // Stock GTA III uses COMOPEN.WAV / SUBOPEN.WAV. Prefer
+                    // an optional MP3 override; otherwise play the original WAV.
+                    const char* basename = ann == 0 ? "COMOPEN" : "SUBOPEN";
+                    std::string annFile = gGameFolder + "audio\\" + basename + ".MP3";
+                    if (!FileExists(annFile))
+                        annFile = gGameFolder + "audio\\" + basename + ".WAV";
 
                     StopRadio();
                     StopStaticSound();

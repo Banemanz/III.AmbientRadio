@@ -41,8 +41,10 @@ require("if (!inVehicle) {" in main and
         "Exit must run before queued playback")
 require("plugin::CallMethod<0x5680E0" not in main,
         "Do not stop shared streamed audio channel zero every frame")
-require("COMOPEN.MP3" in main and "SUBOPEN.MP3" in main,
-        "Use GTA III bridge broadcast filenames")
+require('basename + ".WAV"' in main and
+        '"COMOPEN" : "SUBOPEN"' in main and
+        'basename + ".WAV"' in switch,
+        "Stock GTA III WAV bridge broadcasts must be supported")
 require("Hook_PlayRadioAnnouncement" in switch and "0x57CC60" in switch,
         "Hook native GTA III announcement dispatch")
 require("if (op != 0x041E && op != 0x0394 && op != 0x03D1)" in switch and

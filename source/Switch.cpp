@@ -259,10 +259,18 @@ static void ApplyRadioSuppression(bool suppress)
 static void __fastcall Hook_PlayRadioAnnouncement(cDMAudio* self, void*, unsigned char announcement)
 {
     if (announcement == 13 || announcement == 14) {
-        const char* filename = (announcement == 13) ? "COMOPEN.MP3" : "SUBOPEN.MP3";
-        std::string path = gGameFolder + "audio\\" + filename;
-        DWORD attributes = GetFileAttributesA(path.c_str());
-        if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        const char* basename = (announcement == 13) ? "COMOPEN" : "SUBOPEN";
+        // Stock GTA III PC ships WAV bridge announcements; accept MP3
+        // replacements without requiring a separate modded audio archive.
+        std::string mp3 = gGameFolder + "audio\\" + basename + ".MP3";
+        std::string wav = gGameFolder + "audio\\" + basename + ".WAV";
+        DWORD attributesMp3 = GetFileAttributesA(mp3.c_str());
+        DWORD attributesWav = GetFileAttributesA(wav.c_str());
+        bool hasMp3 = attributesMp3 != INVALID_FILE_ATTRIBUTES &&
+            !(attributesMp3 & FILE_ATTRIBUTE_DIRECTORY);
+        bool hasWav = attributesWav != INVALID_FILE_ATTRIBUTES &&
+            !(attributesWav & FILE_ATTRIBUTE_DIRECTORY);
+        if (hasMp3 || hasWav) {
             gPendingAnnouncement.store(announcement == 13 ? 0 : 1, std::memory_order_release);
             return;
         }
