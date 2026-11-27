@@ -65,8 +65,12 @@ static DWORD gAmbientLastVolTick = 0;
 // gAmbientBuf: protected by gAmbientMutex
 // gAmbientReadyStream: fully prepared stream, handed to main thread
 static std::mutex gAmbientMutex;
-static std::vector<BYTE> gAmbientBuf;
+static std::vector<BYTE> gAmbientReadyBuffer; // worker -> main handoff, under mutex
+static std::vector<BYTE> gAmbientActiveBuffer; // borrowed by BASS until StreamFree
 static HSTREAM gAmbientReadyStream = 0;
+static std::atomic<unsigned int> gAmbientGeneration{ 0 };
+static std::atomic<DWORD> gAmbientRetryAfter{ 0 };
+static bool gAmbientWasPaused = false;
 static std::atomic<bool> gAmbientStreamReady(false);
 static std::atomic<bool> gAmbientLoadingInProgress(false);
 static int gAmbientLoadingStation = -1;
@@ -74,24 +78,28 @@ static int gAmbientLoadingStation = -1;
 
 static void StopAmbientStream()
 {
+    gAmbientGeneration.fetch_add(1, std::memory_order_acq_rel);
     if (gAmbientStream) {
         BASS_ChannelStop(gAmbientStream);
         BASS_StreamFree(gAmbientStream);
         gAmbientStream = 0;
     }
-    // Also free any ready-but-unplayed stream
+    gAmbientActiveBuffer.clear(); // AFTER BASS_StreamFree
     {
         std::lock_guard<std::mutex> lock(gAmbientMutex);
         if (gAmbientReadyStream) {
             BASS_StreamFree(gAmbientReadyStream);
             gAmbientReadyStream = 0;
         }
-        gAmbientBuf.clear();
+        gAmbientReadyBuffer.clear();
     }
     gAmbientStation = -1;
     gAmbientVehicle = nullptr;
     gAmbientLastVol = -1.0f;
-    gAmbientStreamReady = false;
+    gAmbientLastVolTick = 0;
+    gAmbientStreamReady.store(false, std::memory_order_release);
+    gAmbientLoadingInProgress.store(false, std::memory_order_release);
+    gAmbientWasPaused = false;
 }
 
 static bool IsADF(const std::string& path)
@@ -128,22 +136,25 @@ static float CalcVolume(float distance)
 }
 
 // Everything heavy runs here — file I/O, decoding, stream creation, FX setup
-static void AmbientLoadThread(int stationIndex)
+static void AmbientLoadThread(int stationIndex, unsigned int generation, double timelineSnapshot)
 {
-    if (stationIndex < 0 || stationIndex >= (int)stations.size()) {
-        gAmbientLoadingInProgress = false;
-        return;
-    }
+    if (stationIndex < 0 || stationIndex >= (int)stations.size()) return;
+    auto fail = [&]() {
+        if (gAmbientGeneration.load(std::memory_order_acquire) == generation) {
+            gAmbientLoadingInProgress.store(false, std::memory_order_release);
+            gAmbientRetryAfter.store(GetTickCount() + 2000, std::memory_order_release);
+        }
+    };
 
     std::string fullPath = gGameFolder + stations[stationIndex].file;
     HSTREAM stream = 0;
-
+    std::vector<BYTE> ownedAdfBuffer;
     if (IsADF(fullPath)) {
         std::ifstream f(fullPath, std::ios::binary);
         if (!f.is_open()) {
             gLog << "Ambient: cannot open " << fullPath << std::endl;
             gLog.flush();
-            gAmbientLoadingInProgress = false;
+            fail();
             return;
         }
 
@@ -163,13 +174,12 @@ static void AmbientLoadThread(int stationIndex)
         if (!stream) {
             gLog << "Ambient: BASS error " << BASS_ErrorGetCode() << std::endl;
             gLog.flush();
-            gAmbientLoadingInProgress = false;
+            fail();
             return;
         }
 
-        // Keep buffer alive under lock
-        std::lock_guard<std::mutex> lock(gAmbientMutex);
-        gAmbientBuf = std::move(buf);
+        // Keep the worker's source memory alive until the ready handoff.
+        ownedAdfBuffer = std::move(buf);
     }
     else {
         stream = BASS_StreamCreateFile(FALSE, fullPath.c_str(), 0, 0,
@@ -178,7 +188,7 @@ static void AmbientLoadThread(int stationIndex)
         if (!stream) {
             gLog << "Ambient: BASS error " << BASS_ErrorGetCode() << std::endl;
             gLog.flush();
-            gAmbientLoadingInProgress = false;
+            fail();
             return;
         }
     }
@@ -187,7 +197,7 @@ static void AmbientLoadThread(int stationIndex)
     QWORD totalBytes = BASS_ChannelGetLength(stream, BASS_POS_BYTE);
     double totalMs = BASS_ChannelBytes2Seconds(stream, totalBytes) * 1000.0;
     if (totalMs > 0.0) {
-        double seekMs = fmod(StationTimelineMs(stationIndex, false), totalMs);
+        double seekMs = fmod(timelineSnapshot, totalMs);
         QWORD seekBytes = BASS_ChannelSeconds2Bytes(stream, seekMs / 1000.0);
         BASS_ChannelSetPosition(stream, seekBytes, BASS_POS_BYTE);
     }
@@ -196,16 +206,16 @@ static void AmbientLoadThread(int stationIndex)
     // These stay in bass.dll (no bass_fx add-on) and can be toggled in the INI.
     if (gAmbientRadioParamEq) {
         BASS_DX8_PARAMEQ eq;
-        eq.fBandwidth = 18.0f;
+        eq.fBandwidth = 1.6f;
 
         HFX hFx = BASS_ChannelSetFX(stream, BASS_FX_DX8_PARAMEQ, 1);
-        eq.fCenter = 800.0f;
-        eq.fGain = -18.0f;
+        eq.fCenter = 180.0f;
+        eq.fGain = -5.0f;
         BASS_FXSetParameters(hFx, &eq);
 
         HFX hFx2 = BASS_ChannelSetFX(stream, BASS_FX_DX8_PARAMEQ, 2);
-        eq.fCenter = 3500.0f;
-        eq.fGain = -28.0f;
+        eq.fCenter = 5500.0f;
+        eq.fGain = -8.0f;
         BASS_FXSetParameters(hFx2, &eq);
     }
 
@@ -214,8 +224,8 @@ static void AmbientLoadThread(int stationIndex)
         comp.fGain = 0.0f;
         comp.fAttack = 8.0f;
         comp.fRelease = 120.0f;
-        comp.fThreshold = -18.0f;
-        comp.fRatio = 3.0f;
+        comp.fThreshold = -14.0f;
+        comp.fRatio = 2.0f;
         comp.fPredelay = 4.0f;
         HFX hComp = BASS_ChannelSetFX(stream, BASS_FX_DX8_COMPRESSOR, 3);
         BASS_FXSetParameters(hComp, &comp);
@@ -231,30 +241,35 @@ static void AmbientLoadThread(int stationIndex)
         BASS_FXSetParameters(hRev, &rev);
     }
 
-    // Hand the ready stream to the main thread
+    // Publish the stream and its borrowed memory as a single ownership transfer.
+    // An obsolete worker frees only its own stream, never the active one.
     {
         std::lock_guard<std::mutex> lock(gAmbientMutex);
+        if (gAmbientGeneration.load(std::memory_order_acquire) != generation) {
+            BASS_StreamFree(stream);
+            return;
+        }
+        gAmbientReadyBuffer = std::move(ownedAdfBuffer);
         gAmbientReadyStream = stream;
+        gAmbientStreamReady.store(true, std::memory_order_release);
+        gAmbientLoadingInProgress.store(false, std::memory_order_release);
     }
-
-    gLog << "Ambient: ready [" << stations[stationIndex].name << "]" << std::endl;
-    gLog.flush();
-
-    gAmbientStreamReady = true;
-    gAmbientLoadingInProgress = false;
 }
 
 static void StartAmbientLoad(int stationIndex, CVehicle* pVehicle)
 {
-    if (gAmbientLoadingInProgress) return;
+    if (stationIndex < 0 || stationIndex >= (int)stations.size()) return;
+    if (gAmbientLoadingInProgress.load(std::memory_order_acquire)) return;
+    if ((int)(GetTickCount() - gAmbientRetryAfter.load(std::memory_order_acquire)) < 0)
+        return;
 
     StopAmbientStream();
+    unsigned int gen = gAmbientGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     gAmbientLoadingStation = stationIndex;
     gAmbientVehicle = pVehicle;
-    gAmbientLoadingInProgress = true;
-    gAmbientStreamReady = false;
-
-    std::thread(AmbientLoadThread, stationIndex).detach();
+    gAmbientLoadingInProgress.store(true, std::memory_order_release);
+    gAmbientStreamReady.store(false, std::memory_order_release);
+    std::thread(AmbientLoadThread, stationIndex, gen, gRadioTime).detach();
 }
 
 extern bool gAmbientRadioEnabled;
@@ -274,11 +289,15 @@ public:
                 }
 
                 if (FrontEndMenuManager.m_bMenuActive) {
-                    if (gAmbientStream) BASS_ChannelPause(gAmbientStream);
+                    if (gAmbientStream && !gAmbientWasPaused) {
+                        BASS_ChannelPause(gAmbientStream);
+                        gAmbientWasPaused = true;
+                    }
                     return;
                 }
-                else if (gAmbientStream) {
-                    BASS_ChannelPlay(gAmbientStream, FALSE);
+                if (gAmbientStream && gAmbientWasPaused) {
+                    BASS_ChannelPlay(gAmbientStream, FALSE); // only after unpause
+                    gAmbientWasPaused = false;
                 }
 
                 CVehicle* playerVehicle = pPlayer->m_pVehicle;
@@ -288,6 +307,7 @@ public:
                 static CVehicle* sCachedVehicle = nullptr;
                 static int sCachedStation = -1;
                 static float sCachedDistSq = 9999.0f;
+                static CVector sCachedPosition(0.0f, 0.0f, 0.0f);
                 static DWORD sScanTick = 0;
 
                 DWORD nowScan = GetTickCount();
@@ -297,6 +317,7 @@ public:
                     CVehicle* newVehicle = nullptr;
                     int newStation = -1;
                     float newDistSq = gAmbientRadioDistance * gAmbientRadioDistance;
+                    CVector newPosition(0.0f, 0.0f, 0.0f);
 
                     for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
                         if (CPools::ms_pVehiclePool->IsFreeSlotAtIndex(i)) continue;
@@ -319,6 +340,7 @@ public:
                         if (distSq < newDistSq) {
                             newDistSq = distSq;
                             newVehicle = pVeh;
+                            newPosition = vehPos;
                             if (newVehicle != sCachedVehicle) {
                                 if (it != gVehicleStationMap.end() && !it->second.empty()) {
                                     const std::vector<int>& options = it->second;
@@ -338,6 +360,7 @@ public:
                     }
 
                     sCachedDistSq = newDistSq;
+                    sCachedPosition = newPosition;
                     if (newVehicle != sCachedVehicle) {
                         sCachedVehicle = newVehicle;
                         sCachedStation = newStation;
@@ -366,12 +389,15 @@ public:
                         std::lock_guard<std::mutex> lock(gAmbientMutex);
                         gAmbientStream = gAmbientReadyStream;
                         gAmbientReadyStream = 0;
+                        gAmbientActiveBuffer = std::move(gAmbientReadyBuffer);
                     }
+                    if (!gAmbientStream) return;
                     gAmbientStation = gAmbientLoadingStation;
                     float vol = volume * gameVol;
                     BASS_ChannelSetAttribute(gAmbientStream, BASS_ATTRIB_VOL, vol);
                     BASS_ChannelPlay(gAmbientStream, FALSE);
                     gAmbientLastVol = vol;
+                    gAmbientWasPaused = false;
                     gLog << "Ambient: playing [" << stations[gAmbientStation].name << "]" << std::endl;
                     gLog.flush();
                     return;
@@ -388,10 +414,19 @@ public:
                         if (now - gAmbientLastVolTick >= 100) {
                             gAmbientLastVolTick = now;
                             float newVol = volume * gameVol;
-                            if (fabsf(newVol - gAmbientLastVol) > 0.005f) {
-                                BASS_ChannelSetAttribute(gAmbientStream, BASS_ATTRIB_VOL, newVol);
-                                gAmbientLastVol = newVol;
+                            float smoothVol = gAmbientLastVol + (newVol - gAmbientLastVol) * 0.40f;
+                            if (fabsf(smoothVol - gAmbientLastVol) > 0.002f) {
+                                BASS_ChannelSetAttribute(gAmbientStream, BASS_ATTRIB_VOL, smoothVol);
+                                gAmbientLastVol = smoothVol;
                             }
+                            CVector right = pPlayer->GetRight();
+                            float dx = sCachedPosition.x - playerPos.x;
+                            float dy = sCachedPosition.y - playerPos.y;
+                            float planar = sqrtf(dx * dx + dy * dy);
+                            float pan = planar > 0.1f ? (dx * right.x + dy * right.y) / planar * 0.55f : 0.0f;
+                            if (pan < -0.55f) pan = -0.55f;
+                            if (pan > 0.55f) pan = 0.55f;
+                            BASS_ChannelSetAttribute(gAmbientStream, BASS_ATTRIB_PAN, pan);
                         }
                     }
                     return;
