@@ -23,6 +23,11 @@ jobs:
           path: _deps/plugin-sdk
           submodules: recursive
       - uses: microsoft/setup-msbuild@v2
+      - name: Fast source regression checks (before SDK compilation)
+        shell: pwsh
+        run: |
+          python -m py_compile tests/verify_source.py
+          python tests/verify_source.py
       - name: Build Plugin-SDK for GTA III (Win32 Release)
         shell: cmd
         env:
