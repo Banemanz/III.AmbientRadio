@@ -27,6 +27,7 @@ extern std::vector<RadioStation> stations;
 extern double gRadioTime;
 extern std::string gGameFolder;
 extern std::ofstream gLog;
+extern void QueueRadioWorkerLog(const std::string& message);
 extern bool gBassReady;
 extern bool gPlayerInVehicle;
 extern float gAmbientRadioDistance;
@@ -152,8 +153,7 @@ static void AmbientLoadThread(int stationIndex, unsigned int generation, double 
     if (IsADF(fullPath)) {
         std::ifstream f(fullPath, std::ios::binary);
         if (!f.is_open()) {
-            gLog << "Ambient: cannot open " << fullPath << std::endl;
-            gLog.flush();
+            QueueRadioWorkerLog("Ambient: cannot open " + fullPath);
             fail();
             return;
         }
@@ -172,8 +172,7 @@ static void AmbientLoadThread(int stationIndex, unsigned int generation, double 
             (QWORD)buf.size(), BASS_SAMPLE_LOOP);
 
         if (!stream) {
-            gLog << "Ambient: BASS error " << BASS_ErrorGetCode() << std::endl;
-            gLog.flush();
+            QueueRadioWorkerLog("Ambient: BASS error " + std::to_string(BASS_ErrorGetCode()));
             fail();
             return;
         }
@@ -186,8 +185,7 @@ static void AmbientLoadThread(int stationIndex, unsigned int generation, double 
             BASS_SAMPLE_LOOP);
 
         if (!stream) {
-            gLog << "Ambient: BASS error " << BASS_ErrorGetCode() << std::endl;
-            gLog.flush();
+            QueueRadioWorkerLog("Ambient: BASS error " + std::to_string(BASS_ErrorGetCode()));
             fail();
             return;
         }

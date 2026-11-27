@@ -18,6 +18,8 @@ def require(condition, explanation):
     if not condition:
         raise AssertionError(explanation)
 
+require("QueueRadioWorkerLog" in ambient and "FlushRadioWorkerLogs();" in main,
+        "Background diagnostics must be serialized on the game thread")
 require("gActiveStreamBuffer = std::move(gLoadedBuffer)" in main,
         "Player audio must own memory separately from the worker staging buffer")
 require(main.index("BASS_StreamFree(gStream);") < main.index("gActiveStreamBuffer.clear();"),

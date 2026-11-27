@@ -58,6 +58,27 @@ static int gMp3StationIndex = -1;
 std::string gGameFolder;
 std::string gScriptsFolder;
 std::ofstream gLog;
+// Background workers enqueue diagnostics; only the game thread writes to
+// the shared std::ofstream (concurrent operator<< on it is undefined behavior).
+static std::mutex gQueuedRadioLogMutex;
+static std::vector<std::string> gQueuedRadioLogs;
+void QueueRadioWorkerLog(const std::string& line)
+{
+    std::lock_guard<std::mutex> lock(gQueuedRadioLogMutex);
+    gQueuedRadioLogs.push_back(line);
+}
+static void FlushRadioWorkerLogs()
+{
+    std::vector<std::string> lines;
+    {
+        std::lock_guard<std::mutex> lock(gQueuedRadioLogMutex);
+        lines.swap(gQueuedRadioLogs);
+    }
+    if (gLog.is_open() && !lines.empty()) {
+        for (const auto& line : lines) gLog << line << '\n';
+        gLog.flush();
+    }
+}
 bool gAmbientRadioEnabled = false;
 float gAmbientRadioDistance = 60.0f;
 float gAmbientRadioFullVolumeDistance = 8.0f;
@@ -623,8 +644,7 @@ static void LoadStationThread(int index, unsigned int generation, double timelin
     }
 
     std::string fullPath = gGameFolder + stations[index].file;
-    gLog << "Thread: loading " << fullPath << std::endl;
-    gLog.flush();
+    QueueRadioWorkerLog("Thread: loading " + fullPath);
 
     std::vector<BYTE> buf;
 
@@ -632,8 +652,7 @@ static void LoadStationThread(int index, unsigned int generation, double timelin
     {
         std::ifstream f(fullPath, std::ios::binary);
         if (!f.is_open()) {
-            gLog << "Thread: cannot open file!" << std::endl;
-            gLog.flush();
+            QueueRadioWorkerLog("Thread: cannot open " + fullPath);
             if (gLoadGeneration.load(std::memory_order_acquire) == generation) {
                 gLoadingInProgress.store(false, std::memory_order_release);
                 gBufferReady.store(true, std::memory_order_release); // playback reports missing ADF
@@ -650,8 +669,7 @@ static void LoadStationThread(int index, unsigned int generation, double timelin
             b ^= 0x22;
     }
 
-    gLog << "Thread: loaded " << buf.size() << " bytes" << std::endl;
-    gLog.flush();
+    QueueRadioWorkerLog("Thread: loaded " + std::to_string(buf.size()) + " bytes");
 
     {
         std::lock_guard<std::mutex> lock(gLoadMutex);
@@ -1126,6 +1144,7 @@ public:
 
         Events::gameProcessEvent.Add([]()
             {
+                FlushRadioWorkerLogs();
                 DWORD now = GetTickCount();
                 gRadioTime += (double)(now - gLastTick);
                 gLastTick = now;
